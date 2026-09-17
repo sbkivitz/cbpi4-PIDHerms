@@ -44,6 +44,10 @@ class PID_HERMS(CBPiKettleLogic):
     OUTER_LOOP_RATIO = 5
     # Consecutive failed HLT reads tolerated before the heater is cut.
     MAX_HLT_READ_FAILURES = 5
+    # Outer gains are degrees of HLT offset per degree of mash error, so sane values
+    # are single digits. Anything this large is almost certainly a heater-percent gain
+    # carried over from a pre-0.0.7 config or from AutoTune.
+    LEGACY_GAIN_THRESHOLD = 20.0
     # How long the outer loop may sit pinned at the top of the DeltaTemp band, while
     # the mash is still short of target, before we tell the user the band is too narrow
     # for their rig. The required offset depends on insulation, hose run and coil
@@ -232,6 +236,19 @@ class PID_HERMS(CBPiKettleLogic):
             p = self._float_prop("P", 2.0)
             i = self._float_prop("I", 0.005)
             d = self._float_prop("D", 0.0)
+            # Guard against a config written for <=0.0.6, where P/I/D were heater-percent
+            # gains. Such a value saturates the outer loop almost instantly, which pins
+            # the HLT at the top of the band and silently reverts to fixed-offset
+            # behaviour. Not unsafe, but not what the cascade is for - so say so plainly.
+            if p > self.LEGACY_GAIN_THRESHOLD:
+                message = (
+                    "P={} looks like an old heater-percent gain. Since 0.0.7 the mash "
+                    "P/I/D are degrees of HLT offset per degree of mash error - try "
+                    "P=2.0, I=0.005, D=0.0 and put AutoTune values in HLT_P/HLT_I/HLT_D. "
+                    "Running as configured, but the HLT will sit at its DeltaTemp limit."
+                ).format(p)
+                logging.warning("PIDHerms: %s", message)
+                self.cbpi.notify("PIDHerms", message, NotificationType.WARNING)
             # calc() returns its previous output until its own sample time has elapsed,
             # so a longer sample time here is all that is needed to slow the outer loop.
             self.pid = PIDArduino(
