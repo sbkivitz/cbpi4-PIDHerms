@@ -7,13 +7,19 @@ import datetime
 @parameters([Property.Sensor(label = "HLT_Sensor",
                              description="Sensor of HLT Kettle"),
              Property.Number(label="DeltaTemp", configurable=True, default_value=0,
-                             description="Max permitted overshoot of the HLT above the mash target temp. This is a system-dependent ceiling (insulation, hose length/run, HERMS coil surface area and efficiency all matter) - tune it to your rig. Lower keeps HLT close to the mash temp (gentler, more accurate, slower ramp); higher ramps faster but risks denaturing enzymes in the coil. Heating is paused while HLT exceeds target + DeltaTemp. Set 0 to disable the cap and run pure mash-temp PID."),
+                             description="Max permitted overshoot of the HLT above the mash target. The mash (outer) PID scales the HLT setpoint within this band: full mash demand targets mash_target + DeltaTemp and, as the mash nears its target, the HLT setpoint eases back toward mash_target. System-dependent (insulation, hose length/run, HERMS coil surface area and efficiency) - tune it to your rig. Lower keeps HLT close to the mash temp (gentler/more accurate, slower ramp); higher ramps faster but risks denaturing enzymes in the coil. 0 makes the HLT track the mash target directly (gentlest, HLT approximately equals MT)."),
              Property.Number(label="P", configurable=True, default_value=117.0795, 
-                             description="P Value of PID"),
+                             description="P value of the mash (outer) PID - drives the HLT setpoint from the mash temperature error"),
              Property.Number(label="I", configurable=True, default_value=0.2747, 
-                             description="I Value of PID"),
+                             description="I value of the mash (outer) PID"),
              Property.Number(label="D", configurable=True, default_value=41.58, 
-                             description="D Value of PID"),
+                             description="D value of the mash (outer) PID"),
+             Property.Number(label="HLT_P", configurable=True, default_value=117.0795,
+                             description="P value of the HLT (inner) PID - holds the HLT at the setpoint the mash loop asks for"),
+             Property.Number(label="HLT_I", configurable=True, default_value=0.2747,
+                             description="I value of the HLT (inner) PID"),
+             Property.Number(label="HLT_D", configurable=True, default_value=41.58,
+                             description="D value of the HLT (inner) PID"),
              Property.Select(label="SampleTime", options=[2,5], 
                              description="PID Sample time in seconds. Default: 5 (How often is the output calculation done)"),
              Property.Number(label="Max_Pump_Temp", configurable=True, default_value=88,
@@ -80,7 +86,8 @@ class PID_HERMS(CBPiKettleLogic):
                     await self.actor_off(self.agitator)
                 await asyncio.sleep(1)
 
-    # subroutine that controlls temperature via pid controll
+    # subroutine that controls temperature via a cascaded PID:
+    #   outer (mash) PID -> clamped HLT setpoint -> inner (HLT) PID -> heater power
     async def temp_control(self):
         await self.actor_on(self.heater,0)
         heat_percent_old = 0
@@ -91,40 +98,39 @@ class PID_HERMS(CBPiKettleLogic):
             except Exception:
                 self.HLT_Temp = None
 
-            # get current temeprature
-            sensor_value = current_temp = self.get_sensor_value(self.kettle.sensor).get("value")
-            # get the current target temperature for the kettle
+            # current mash temperature and its target
+            current_temp = self.get_sensor_value(self.kettle.sensor).get("value")
             target_temp = self.get_kettle_target_temp(self.id)
 
-            # HLT overshoot cap. Only limit heating when a positive DeltaTemp
-            # ceiling is configured and the HLT reading is valid. delta <= 0
-            # disables the cap and lets the PID modulate the HLT element purely
-            # on mash temperature. Without this guard a delta of 0 would pause
-            # heating as soon as the HLT rose above the mash target - which it
-            # must in a HERMS to transfer heat - stalling the mash below target.
-            if self.delta > 0 and self.HLT_Temp is not None:
-                delta_temp = self.HLT_Temp - target_temp
-                if (delta_temp > self.delta):
-                    self.PIDActive = False
-                else:
-                    self.PIDActive = True
-            else:
-                self.PIDActive = True
-
-            # if current temperature is higher the defined boil temp, use fixed heating percent instead of PID values for controlled boiling
+            # if current temperature is higher than the defined boil temp, use a fixed
+            # heating percent instead of PID values for controlled boiling
             if current_temp >= self.max_boil_temp:
                 heat_percent = self.max_output_boil
-            # if current temperature is above max pid temp (should be higher than mashout temp and lower then max boil temp) 100% output will be used untile boil temp is reached
+            # above max pid temp (mashout ramp) use max output until boil temp is reached
             elif current_temp >= self.max_pid_temp:
                 heat_percent = self.max_output
-            # at lower temepratures, PID algorythm will valculate heat percent value
+            # mash/PID band: cascade control
             else:
-                if self.PIDActive == True:
-                    heat_percent = self.pid.calc(sensor_value, target_temp)
+                # Outer loop: the mash PID output (0..max_output) sets how far, within
+                # the allowed DeltaTemp band, the HLT setpoint may sit above the mash
+                # target. Full mash demand -> mash_target + DeltaTemp; as the mash nears
+                # its target the demand (and therefore the HLT setpoint) eases back to
+                # mash_target. This bounds HLT overshoot without a bang-bang heater gate.
+                mash_output = self.pid.calc(current_temp, target_temp)
+                if self.max_output > 0:
+                    overshoot = (mash_output / self.max_output) * self.delta
                 else:
-                    heat_percent = 0
+                    overshoot = 0
+                hlt_setpoint = target_temp + overshoot
 
-            # Test with actor power
+                if self.HLT_Temp is not None:
+                    # Inner loop: modulate heater power to hold the HLT at the setpoint.
+                    heat_percent = self.hlt_pid.calc(self.HLT_Temp, hlt_setpoint)
+                else:
+                    # No valid HLT reading: fall back to a direct mash PID so we still heat.
+                    heat_percent = mash_output
+
+            # only push a new power value to the actor when it changes
             if heat_percent != heat_percent_old:
                 await self.actor_set_power(self.heater,heat_percent)
                 heat_percent_old = heat_percent
@@ -139,8 +145,13 @@ class PID_HERMS(CBPiKettleLogic):
             p = float(self.props.get("P", 117.0795))
             i = float(self.props.get("I", 0.2747))
             d = float(self.props.get("D", 41.58))
+            # outer loop: mash temperature -> HLT setpoint offset
             self.pid = PIDArduino(self.sample_time, p, i, d, 0, self.max_output)
-            self.PIDActive = True
+            # inner loop: HLT temperature -> heater power
+            hp = float(self.props.get("HLT_P", 117.0795))
+            hi = float(self.props.get("HLT_I", 0.2747))
+            hd = float(self.props.get("HLT_D", 41.58))
+            self.hlt_pid = PIDArduino(self.sample_time, hp, hi, hd, 0, self.max_output)
 
             self.work_time = float(self.props.get("Rest_Interval", 600))
             self.rest_time = float(self.props.get("Rest_Time", 60))
