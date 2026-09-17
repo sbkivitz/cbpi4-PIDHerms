@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from cbpi.api import *
+from cbpi.api.dataclasses import NotificationType
 import time
 import datetime
 
