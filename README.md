@@ -24,7 +24,7 @@
 	- Rest Time: Pump Rest Time in seconds
 	- SampleTime: 2 or 5 seconds. Determines PID recalcultation frequency
 	- HLT Sensor: Sensor that measures your HLT temperature
-	- DeltaTemp: Plugin allows control of HLT temp. This values determines the max delta temp that the HLT is allowed to be above the Target Mash Temp. Power will be set to 0 if delta temp is larger than max delta.
+	- DeltaTemp: Plugin allows control of HLT temp. This is the maximum overshoot the HLT is allowed above the mash target temp before heating is paused. It is a system-dependent ceiling - insulation, hose length/run, and HERMS coil surface area/efficiency all affect how much hotter the HLT must run to move heat into the mash. Tune it to your rig: lower keeps the HLT close to the mash temp (gentler and more accurate, slower ramp), higher ramps faster but risks denaturing enzymes in the coil. Set 0 to disable the cap and run a pure mash-temp PID.
 
 ## Installation:
 - sudo pip3 install cbpi4-PIDHerms 
@@ -34,6 +34,8 @@
 - CBPi4 Version 4.0.0.45 or later (currently only available from my fork)
 
 Changelog:
+
+- 29.07.26: (0.0.5) DeltaTemp is now a proper ceiling: values <= 0 disable the cap and run a pure mash-temp PID instead of pausing all heating (previous behaviour with the default of 0 stalled the mash). Clarified the DeltaTemp description, narrowed a bare except and removed an unused import.
 
 - 11.05.22: (0.0.4) Updated README (removed cbpi add)
 - 10.05.22: (0.0.3) Removed cbpi dependency
