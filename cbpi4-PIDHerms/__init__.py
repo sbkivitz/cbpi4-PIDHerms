@@ -1,5 +1,4 @@
 import asyncio
-from asyncio import tasks
 import logging
 from cbpi.api import *
 import time
@@ -7,8 +6,8 @@ import datetime
 
 @parameters([Property.Sensor(label = "HLT_Sensor",
                              description="Sensor of HLT Kettle"),
-             Property.Number(label="DeltaTemp", configurable=True, 
-                             description="Max Delta HLT Temp above Mash Target Temp (Heater/PID will switch off if delta between HLT and Mash is larger)"),
+             Property.Number(label="DeltaTemp", configurable=True, default_value=0,
+                             description="Max permitted overshoot of the HLT above the mash target temp. This is a system-dependent ceiling (insulation, hose length/run, HERMS coil surface area and efficiency all matter) - tune it to your rig. Lower keeps HLT close to the mash temp (gentler, more accurate, slower ramp); higher ramps faster but risks denaturing enzymes in the coil. Heating is paused while HLT exceeds target + DeltaTemp. Set 0 to disable the cap and run pure mash-temp PID."),
              Property.Number(label="P", configurable=True, default_value=117.0795, 
                              description="P Value of PID"),
              Property.Number(label="I", configurable=True, default_value=0.2747, 
@@ -89,7 +88,7 @@ class PID_HERMS(CBPiKettleLogic):
         while self.running:
             try:
                 self.HLT_Temp = self.get_sensor_value(self.sensor).get("value")
-            except:
+            except Exception:
                 self.HLT_Temp = None
 
             # get current temeprature
@@ -97,12 +96,20 @@ class PID_HERMS(CBPiKettleLogic):
             # get the current target temperature for the kettle
             target_temp = self.get_kettle_target_temp(self.id)
 
-            if self.HLT_Temp is not None:
+            # HLT overshoot cap. Only limit heating when a positive DeltaTemp
+            # ceiling is configured and the HLT reading is valid. delta <= 0
+            # disables the cap and lets the PID modulate the HLT element purely
+            # on mash temperature. Without this guard a delta of 0 would pause
+            # heating as soon as the HLT rose above the mash target - which it
+            # must in a HERMS to transfer heat - stalling the mash below target.
+            if self.delta > 0 and self.HLT_Temp is not None:
                 delta_temp = self.HLT_Temp - target_temp
                 if (delta_temp > self.delta):
                     self.PIDActive = False
                 else:
                     self.PIDActive = True
+            else:
+                self.PIDActive = True
 
             # if current temperature is higher the defined boil temp, use fixed heating percent instead of PID values for controlled boiling
             if current_temp >= self.max_boil_temp:
