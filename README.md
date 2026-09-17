@@ -17,7 +17,7 @@
 
 ## Parameters:
 - Configurable:
-	- P / I / D: parameters of the **mash (outer)** PID. These are in **degrees of HLT offset per degree of mash error**, not heater percent, so AutoTune values do not apply here. Defaults: P=2.0, I=0.005, D=0.0.
+	- P / I / D: parameters of the **mash (outer)** PID. These are in **degrees of HLT offset per degree of mash error**, not heater percent, so AutoTune values do not apply here. Defaults: P=2.0, I=0.005, D=0.0. If a value carried over from 0.0.6 or earlier is detected (P above 20), the plugin warns you in the UI and keeps running - the effect is the old fixed-offset behaviour, not a safety problem.
 	- HLT_P / HLT_I / HLT_D: parameters of the **HLT (inner)** PID that holds the HLT at the requested setpoint. These drive heater power, so AutoTune values belong here.
 	- Max Output: Maximum Power (%) to be used for PID during Ramp up
 	- Max Boil Output: Maximum Power during when Boil Temp is reached
