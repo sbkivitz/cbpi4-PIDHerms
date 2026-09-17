@@ -6,14 +6,14 @@ import datetime
 
 @parameters([Property.Sensor(label = "HLT_Sensor",
                              description="Sensor of HLT Kettle"),
-             Property.Number(label="DeltaTemp", configurable=True, default_value=0,
-                             description="Max permitted overshoot of the HLT above the mash target. The mash (outer) PID scales the HLT setpoint within this band: full mash demand targets mash_target + DeltaTemp and, as the mash nears its target, the HLT setpoint eases back toward mash_target. System-dependent (insulation, hose length/run, HERMS coil surface area and efficiency) - tune it to your rig. Lower keeps HLT close to the mash temp (gentler/more accurate, slower ramp); higher ramps faster but risks denaturing enzymes in the coil. 0 makes the HLT track the mash target directly (gentlest, HLT approximately equals MT)."),
-             Property.Number(label="P", configurable=True, default_value=117.0795, 
-                             description="P value of the mash (outer) PID - drives the HLT setpoint from the mash temperature error"),
-             Property.Number(label="I", configurable=True, default_value=0.2747, 
-                             description="I value of the mash (outer) PID"),
-             Property.Number(label="D", configurable=True, default_value=41.58, 
-                             description="D value of the mash (outer) PID"),
+             Property.Number(label="DeltaTemp", configurable=True, default_value=3,
+                             description="Width of the HLT overshoot band, in the configured temperature unit. The mash (outer) PID raises the HLT setpoint up to mash_target + DeltaTemp when it wants heat, and eases it back toward mash_target as the mash reaches setpoint, so at rest the HLT sits close to the mash temperature. A HERMS only moves heat while the HLT is hotter than the wort, so this must be greater than 0; values of 0 or less are raised to a small floor. System-dependent (insulation, hose length/run, HERMS coil surface area and efficiency) - tune it to your rig. Lower tracks the mash more tightly and is gentler on enzymes but ramps slower; higher ramps faster but risks denaturing enzymes in the coil."),
+             Property.Number(label="P", configurable=True, default_value=2.0,
+                             description="P value of the mash (outer) PID, in degrees of HLT offset per degree of mash error. NOTE: these are NOT heater-percent gains and must not be taken from the PID AutoTune plugin - use HLT_P/HLT_I/HLT_D for that."),
+             Property.Number(label="I", configurable=True, default_value=0.005,
+                             description="I value of the mash (outer) PID (degrees of HLT offset per degree of mash error per second)"),
+             Property.Number(label="D", configurable=True, default_value=0.0,
+                             description="D value of the mash (outer) PID. 0 is a good starting point - the inner HLT loop already damps the response."),
              Property.Number(label="HLT_P", configurable=True, default_value=117.0795,
                              description="P value of the HLT (inner) PID - holds the HLT at the setpoint the mash loop asks for"),
              Property.Number(label="HLT_I", configurable=True, default_value=0.2747,
@@ -39,6 +39,17 @@ import datetime
 
 class PID_HERMS(CBPiKettleLogic):
 
+    # The inner (HLT) loop must settle faster than the outer (mash) loop or the two
+    # hunt against each other. The outer PID runs this many times slower.
+    OUTER_LOOP_RATIO = 5
+    # Consecutive failed HLT reads tolerated before the heater is cut.
+    MAX_HLT_READ_FAILURES = 5
+    # How long the outer loop may sit pinned at the top of the DeltaTemp band, while
+    # the mash is still short of target, before we tell the user the band is too narrow
+    # for their rig. The required offset depends on insulation, hose run and coil
+    # surface area, so it cannot be guessed - but it can be detected.
+    SATURATION_WARN_SECONDS = 900
+
     def __init__(self, cbpi, id, props):
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
@@ -46,6 +57,20 @@ class PID_HERMS(CBPiKettleLogic):
         self.work_time, self.rest_time, self.max_output_boil = None, None, None
         self.max_boil_temp, self.max_pid_temp, self.max_pump_temp = None, None, None
         self.kettle, self.heater, self.agitator = None, None, None
+
+    def _float_prop(self, name, default):
+        """Read a numeric property, falling back to default when it is missing, blank
+        or unparsable, so a cleared field in the UI cannot kill the control loop."""
+        value = self.props.get(name, None)
+        if value is None or str(value).strip() == "":
+            return float(default)
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "PIDHerms: could not parse %s=%r, using %s", name, value, default
+            )
+            return float(default)
 
     async def on_stop(self):
         await self.actor_off(self.agitator)
@@ -91,11 +116,16 @@ class PID_HERMS(CBPiKettleLogic):
     async def temp_control(self):
         await self.actor_on(self.heater,0)
         heat_percent_old = 0
+        hlt_read_failures = 0
+        hlt_fault_notified = False
+        saturated_seconds = 0
+        band_warning_sent = False
 
         while self.running:
             try:
-                self.HLT_Temp = self.get_sensor_value(self.sensor).get("value")
-            except Exception:
+                hlt_value = self.get_sensor_value(self.sensor).get("value")
+                self.HLT_Temp = float(hlt_value)
+            except (TypeError, ValueError, AttributeError):
                 self.HLT_Temp = None
 
             # current mash temperature and its target
@@ -111,24 +141,55 @@ class PID_HERMS(CBPiKettleLogic):
                 heat_percent = self.max_output
             # mash/PID band: cascade control
             else:
-                # Outer loop: the mash PID output (0..max_output) sets how far, within
-                # the allowed DeltaTemp band, the HLT setpoint may sit above the mash
-                # target. Full mash demand -> mash_target + DeltaTemp; as the mash nears
-                # its target the demand (and therefore the HLT setpoint) eases back to
-                # mash_target. This bounds HLT overshoot without a bang-bang heater gate.
-                mash_output = self.pid.calc(current_temp, target_temp)
-                if self.max_output > 0:
-                    overshoot = (mash_output / self.max_output) * self.delta
+                # Outer loop: the mash PID's output IS the HLT setpoint offset, in
+                # degrees, and the PID itself bounds it to [0, DeltaTemp]. Because the
+                # band limit and the PID's anti-windup boundary are the same value, the
+                # integral cannot wind up against the cap. Full mash demand targets
+                # mash_target + DeltaTemp; as the mash nears its target the offset eases
+                # back toward mash_target, so at rest the HLT sits close to the mash.
+                hlt_setpoint = target_temp + self.pid.calc(current_temp, target_temp)
+
+                # If the outer loop has been asking for the full band for a long time
+                # and the mash is still short, the band itself is the limit: the rig
+                # needs a bigger HLT-to-mash offset than DeltaTemp allows.
+                if hlt_setpoint >= target_temp + self.delta - 1e-9 and current_temp < target_temp - 0.5:
+                    saturated_seconds += self.sample_time
+                    if saturated_seconds >= self.SATURATION_WARN_SECONDS and not band_warning_sent:
+                        band_warning_sent = True
+                        self.cbpi.notify(
+                            "PIDHerms",
+                            "DeltaTemp ({}) may be too small for this system - the HLT "
+                            "has been held at its limit and the mash is still below "
+                            "target. Increase DeltaTemp if the mash cannot hold "
+                            "setpoint.".format(self.delta),
+                            NotificationType.WARNING,
+                        )
                 else:
-                    overshoot = 0
-                hlt_setpoint = target_temp + overshoot
+                    saturated_seconds = 0
+                    band_warning_sent = False
 
                 if self.HLT_Temp is not None:
+                    hlt_read_failures = 0
+                    hlt_fault_notified = False
                     # Inner loop: modulate heater power to hold the HLT at the setpoint.
                     heat_percent = self.hlt_pid.calc(self.HLT_Temp, hlt_setpoint)
                 else:
-                    # No valid HLT reading: fall back to a direct mash PID so we still heat.
-                    heat_percent = mash_output
+                    # With no HLT reading nothing is bounding the HLT, and the outer
+                    # loop's output is in degrees, not percent, so it cannot drive the
+                    # element. Ride out a brief dropout on the last known power, then
+                    # fail safe rather than heating blind.
+                    hlt_read_failures += 1
+                    if hlt_read_failures <= self.MAX_HLT_READ_FAILURES:
+                        heat_percent = heat_percent_old
+                    else:
+                        heat_percent = 0
+                        if not hlt_fault_notified:
+                            hlt_fault_notified = True
+                            self.cbpi.notify(
+                                "PIDHerms",
+                                "No HLT sensor reading - heater turned off",
+                                NotificationType.ERROR,
+                            )
 
             # only push a new power value to the actor when it changes
             if heat_percent != heat_percent_old:
@@ -140,28 +201,52 @@ class PID_HERMS(CBPiKettleLogic):
     async def run(self):
         self._logger = logging.getLogger(type(self).__name__)
         try:
-            self.sample_time = int(self.props.get("SampleTime",5))
-            self.max_output = int(self.props.get("Max_Output",100))
-            p = float(self.props.get("P", 117.0795))
-            i = float(self.props.get("I", 0.2747))
-            d = float(self.props.get("D", 41.58))
-            # outer loop: mash temperature -> HLT setpoint offset
-            self.pid = PIDArduino(self.sample_time, p, i, d, 0, self.max_output)
-            # inner loop: HLT temperature -> heater power
-            hp = float(self.props.get("HLT_P", 117.0795))
-            hi = float(self.props.get("HLT_I", 0.2747))
-            hd = float(self.props.get("HLT_D", 41.58))
+            self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
+            boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
+            maxpidtemp = 88 if self.TEMP_UNIT == "C" else 190
+            maxpumptemp = 88 if self.TEMP_UNIT == "C" else 190
+            default_delta = 3 if self.TEMP_UNIT == "C" else 5
+            # A HERMS only moves heat while the HLT is hotter than the wort. A zero or
+            # negative band leaves the outer loop no authority at all, so the mash would
+            # never reach target. Hold a small floor rather than stalling. This floor
+            # only guarantees the loop can act; the offset a given rig actually needs
+            # depends on its insulation, hose run and coil, so a band that is too narrow
+            # is reported at runtime (see SATURATION_WARN_SECONDS) instead of guessed.
+            min_delta = 1.0 if self.TEMP_UNIT == "C" else 2.0
+
+            self.sample_time = int(self.props.get("SampleTime", 5))
+            self.max_output = int(self.props.get("Max_Output", 100))
+
+            self.delta = self._float_prop("DeltaTemp", default_delta)
+            if self.delta < min_delta:
+                logging.warning(
+                    "PIDHerms: DeltaTemp %s is below the usable minimum for a HERMS, "
+                    "using %s %s instead", self.delta, min_delta, self.TEMP_UNIT
+                )
+                self.delta = min_delta
+
+            # Outer loop: mash error -> HLT setpoint offset, in degrees. Bounding the
+            # PID's own output by DeltaTemp makes the band limit and the PID's
+            # anti-windup boundary the same thing, so the integral cannot wind up
+            # against the cap.
+            p = self._float_prop("P", 2.0)
+            i = self._float_prop("I", 0.005)
+            d = self._float_prop("D", 0.0)
+            # calc() returns its previous output until its own sample time has elapsed,
+            # so a longer sample time here is all that is needed to slow the outer loop.
+            self.pid = PIDArduino(
+                self.sample_time * self.OUTER_LOOP_RATIO, p, i, d, 0, self.delta
+            )
+
+            # Inner loop: HLT error -> heater percent. These are the AutoTune-style gains.
+            hp = self._float_prop("HLT_P", 117.0795)
+            hi = self._float_prop("HLT_I", 0.2747)
+            hd = self._float_prop("HLT_D", 41.58)
             self.hlt_pid = PIDArduino(self.sample_time, hp, hi, hd, 0, self.max_output)
 
             self.work_time = float(self.props.get("Rest_Interval", 600))
             self.rest_time = float(self.props.get("Rest_Time", 60))
             self.max_output_boil = float(self.props.get("Max_Boil_Output", 85))
-            
-            self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
-            boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
-            maxpidtemp = 88 if self.TEMP_UNIT == "C" else 190
-            maxpumptemp = 88 if self.TEMP_UNIT == "C" else 190
-
 
             self.max_boil_temp = float(self.props.get("Max_Boil_Temp", boilthreshold))
             self.max_pid_temp = float(self.props.get("Max_PID_Temp", maxpidtemp))
@@ -171,9 +256,12 @@ class PID_HERMS(CBPiKettleLogic):
             self.heater = self.kettle.heater
             self.agitator = self.kettle.agitator
             self.sensor = self.props.get("HLT_Sensor", None)
-            self.delta = float(self.props.get("DeltaTemp",0))
 
-            logging.info("CustomLogic P:{} I:{} D:{} {} {}".format(p, i, d, self.kettle, self.heater))
+            logging.info(
+                "PIDHerms outer P:{} I:{} D:{} band:{} / inner P:{} I:{} D:{} {} {}".format(
+                    p, i, d, self.delta, hp, hi, hd, self.kettle, self.heater
+                )
+            )
 
             pump_controller = asyncio.create_task(self.pump_control())
             temp_controller = asyncio.create_task(self.temp_control())
