@@ -45,6 +45,10 @@ class PID_HERMS(CBPiKettleLogic):
     OUTER_LOOP_RATIO = 5
     # Consecutive failed HLT reads tolerated before the heater is cut.
     MAX_HLT_READ_FAILURES = 5
+    # Consecutive zero-demand samples before the heater actor is switched off
+    # rather than merely held at 0%. Purely to stop a PID sitting at zero from
+    # chattering a contactor - at 0% duty no heat is produced either way.
+    OFF_DWELL_SAMPLES = 3
     # Outer gains are degrees of HLT offset per degree of mash error, so sane values
     # are single digits. Anything this large is almost certainly a heater-percent gain
     # carried over from a pre-0.0.7 config or from AutoTune.
@@ -119,7 +123,18 @@ class PID_HERMS(CBPiKettleLogic):
     # subroutine that controls temperature via a cascaded PID:
     #   outer (mash) PID -> clamped HLT setpoint -> inner (HLT) PID -> heater power
     async def temp_control(self):
-        await self.actor_on(self.heater,0)
+        # Deliberately not actor_on(heater, 0) here. A plain GPIOActor's on()
+        # drives the pin HIGH immediately and ignores the power argument, so that
+        # call energized the element before any demand existed.
+        #
+        # Switching it off instead establishes the same known starting state
+        # without the pulse, and matters because actor state survives a restart:
+        # without this, an element left on by a previous run would stay on while
+        # this loop believed it was off, and nothing here would ever switch it
+        # off. The element is switched on below, once the loop asks for heat.
+        await self.actor_off(self.heater)
+        heater_is_on = False
+        zero_demand_samples = 0
         heat_percent_old = 0
         hlt_read_failures = 0
         hlt_fault_notified = False
@@ -151,6 +166,8 @@ class PID_HERMS(CBPiKettleLogic):
                 else:
                     heat_percent = 0
                     await self.actor_off(self.heater)
+                    heater_is_on = False
+                    zero_demand_samples = 0
                     heat_percent_old = 0
                     if not hlt_fault_notified:
                         hlt_fault_notified = True
@@ -205,8 +222,29 @@ class PID_HERMS(CBPiKettleLogic):
                 # HLT_Temp is known valid here - the blind case returned above.
                 heat_percent = self.hlt_pid.calc(self.HLT_Temp, hlt_setpoint)
 
+            # Drive the actor's on/off state, not just its power level.
+            #
+            # ActorController.set_power() only forwards a number to the instance;
+            # it never changes state. For a plain GPIOActor that means a demand of
+            # 0% left the actor nominally on at 0% duty rather than genuinely off,
+            # and the element stayed latched to the control loop's last word.
+            # Switching off once demand has been zero for a few samples keeps it
+            # de-energized whenever no heat is wanted.
+            if heat_percent > 0:
+                zero_demand_samples = 0
+                if not heater_is_on:
+                    await self.actor_on(self.heater, heat_percent)
+                    heater_is_on = True
+                    heat_percent_old = heat_percent
+            else:
+                zero_demand_samples += 1
+                if heater_is_on and zero_demand_samples >= self.OFF_DWELL_SAMPLES:
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
+                    heat_percent_old = 0
+
             # only push a new power value to the actor when it changes
-            if heat_percent != heat_percent_old:
+            if heater_is_on and heat_percent != heat_percent_old:
                 await self.actor_set_power(self.heater,heat_percent)
                 heat_percent_old = heat_percent
             await asyncio.sleep(self.sample_time)
