@@ -137,6 +137,34 @@ class PID_HERMS(CBPiKettleLogic):
             current_temp = self.get_sensor_value(self.kettle.sensor).get("value")
             target_temp = self.get_kettle_target_temp(self.id)
 
+            # Nothing else in this plugin bounds HLT temperature - Max_Boil_Temp,
+            # Max_PID_Temp and Max_Pump_Temp are all evaluated against the mash
+            # sensor. So a missing HLT reading has to be handled before any
+            # heating decision, not only inside the PID branch: during a mashout
+            # or boil ramp the branches below command full power unconditionally,
+            # and would otherwise drive the element blind indefinitely.
+            if self.HLT_Temp is None:
+                hlt_read_failures += 1
+                if hlt_read_failures <= self.MAX_HLT_READ_FAILURES:
+                    # Ride out a momentary 1-wire glitch on the last known power.
+                    heat_percent = heat_percent_old
+                else:
+                    heat_percent = 0
+                    await self.actor_off(self.heater)
+                    heat_percent_old = 0
+                    if not hlt_fault_notified:
+                        hlt_fault_notified = True
+                        self.cbpi.notify(
+                            "PIDHerms",
+                            "No HLT sensor reading - heater turned off",
+                            NotificationType.ERROR,
+                        )
+                await asyncio.sleep(self.sample_time)
+                continue
+
+            hlt_read_failures = 0
+            hlt_fault_notified = False
+
             # if current temperature is higher than the defined boil temp, use a fixed
             # heating percent instead of PID values for controlled boiling
             if current_temp >= self.max_boil_temp:
@@ -173,28 +201,9 @@ class PID_HERMS(CBPiKettleLogic):
                     saturated_seconds = 0
                     band_warning_sent = False
 
-                if self.HLT_Temp is not None:
-                    hlt_read_failures = 0
-                    hlt_fault_notified = False
-                    # Inner loop: modulate heater power to hold the HLT at the setpoint.
-                    heat_percent = self.hlt_pid.calc(self.HLT_Temp, hlt_setpoint)
-                else:
-                    # With no HLT reading nothing is bounding the HLT, and the outer
-                    # loop's output is in degrees, not percent, so it cannot drive the
-                    # element. Ride out a brief dropout on the last known power, then
-                    # fail safe rather than heating blind.
-                    hlt_read_failures += 1
-                    if hlt_read_failures <= self.MAX_HLT_READ_FAILURES:
-                        heat_percent = heat_percent_old
-                    else:
-                        heat_percent = 0
-                        if not hlt_fault_notified:
-                            hlt_fault_notified = True
-                            self.cbpi.notify(
-                                "PIDHerms",
-                                "No HLT sensor reading - heater turned off",
-                                NotificationType.ERROR,
-                            )
+                # Inner loop: modulate heater power to hold the HLT at the setpoint.
+                # HLT_Temp is known valid here - the blind case returned above.
+                heat_percent = self.hlt_pid.calc(self.HLT_Temp, hlt_setpoint)
 
             # only push a new power value to the actor when it changes
             if heat_percent != heat_percent_old:
@@ -284,8 +293,21 @@ class PID_HERMS(CBPiKettleLogic):
             pump_controller = asyncio.create_task(self.pump_control())
             temp_controller = asyncio.create_task(self.temp_control())
 
-            await pump_controller
-            await temp_controller
+            # Await both together. Awaiting the pump first meant a crash in
+            # temp_control() was never surfaced while the pump kept running, so
+            # run()'s heater-off finally was never reached and the element stayed
+            # on. Cancel the sibling as soon as either one stops.
+            done, pending = await asyncio.wait(
+                {pump_controller, temp_controller},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            # Re-raise whatever stopped first so it is logged rather than lost.
+            for task in done:
+                task.result()
 
         except asyncio.CancelledError as e:
             pass
