@@ -127,3 +127,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# scratch files for git commit -F (PowerShell mangles inline messages)
+.commitmsg.tmp
