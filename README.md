@@ -10,7 +10,7 @@
 - Because the outer loop backs the HLT setpoint off as the mash approaches target, the HLT settles at the smallest offset your system actually needs rather than sitting at a fixed offset above the mash. Widening `DeltaTemp` raises the ceiling, not the resting HLT temperature.
 - PID AutoTune (https://github.com/avollkopf/cbpi4-PIDAutoTune) measures mash response to **heater power**, so its output applies to the inner loop only: use it for `HLT_P` / `HLT_I` / `HLT_D`. The outer `P` / `I` / `D` are in different units (see below) and must not be taken from AutoTune.
 - Above `Max PID Temp` it heats at max output (mashout ramp); above `Max Boil Temp` it uses the configurable boil power.
-- If the HLT sensor stops reading, the heater holds its last power briefly and is then switched off - the inner loop is the only thing bounding HLT temperature, so it does not keep heating blind.
+- If the HLT sensor stops reading, the heater holds its last power for a few cycles and is then switched off, with a notification. This applies in **every** mode, including the mashout ramp and the boil, where the controller would otherwise command full power without consulting the HLT at all. Nothing else bounds HLT temperature: `Max Boil Temp`, `Max PID Temp` and `Max Pump Temp` are all measured on the **mash** sensor.
 - Kettle Agitator (Pump) is switched on in Automode and can be rested in intervals.
 
 ![CBPi4 Settings](https://github.com/avollkopf/cbpi4-PIDHerms/blob/main/Settings.png?raw=true)
@@ -27,7 +27,53 @@
 	- Rest Time: Pump Rest Time in seconds
 	- SampleTime: 2 or 5 seconds. Determines PID recalcultation frequency
 	- HLT Sensor: Sensor that measures your HLT temperature
-	- DeltaTemp: How far above the mash target the HLT is allowed to run, in degrees. The mash loop raises the HLT setpoint within this band when it wants heat and eases it back toward `mash_target` as the mash reaches setpoint, so at rest the HLT sits close to the mash temperature. How much offset your rig needs depends on insulation, hose length/run, and HERMS coil surface area and efficiency, so there is no universally correct value - tune it to your system. Lower tracks the mash more tightly and is gentler on enzymes but ramps slower; higher ramps faster but risks denaturing enzymes in the coil. A HERMS can only move heat while the HLT is hotter than the wort, so values of 0 or less are raised to a small floor. If the band is too narrow for your system the mash will hold below setpoint; the plugin detects this and notifies you to increase DeltaTemp rather than silently running cold. Default: 3 C / 5 F.
+	- DeltaTemp: How far above the mash target the HLT is allowed to run, in degrees. The mash loop raises the HLT setpoint within this band when it wants heat and eases it back toward `mash_target` as the mash reaches setpoint, so at rest the HLT sits close to the mash temperature. How much offset your rig needs depends on insulation, hose length/run, and HERMS coil surface area and efficiency, so there is no universally correct value - tune it to your system. Lower tracks the mash more tightly and is gentler on enzymes but ramps slower; higher ramps faster but risks denaturing enzymes in the coil. A HERMS can only move heat while the HLT is hotter than the wort, so values of 0 or less are raised to a small floor. If the band is too narrow for your system the mash will hold below setpoint; the plugin detects this and notifies you to increase DeltaTemp rather than silently running cold. Default: 3, which is a reasonable starting point in Celsius. In Fahrenheit 3 degrees is tight (about 1.7 C) - most F rigs will want 5-8. Values below 1 C / 2 F are raised to that floor.
+
+## Tuning, in order
+
+Tune the inner loop first. The outer loop assumes the HLT can hold the setpoint it
+is given; if that is not true, nothing above it will behave.
+
+**1. Inner loop (`HLT_P` / `HLT_I` / `HLT_D`)** — these drive heater percent from HLT
+error, which is exactly what the PID AutoTune plugin measures. Run AutoTune on the
+HLT and put its numbers here. The defaults (117.0795 / 0.2747 / 41.58) are a
+reasonable starting point for a typical electric HLT.
+
+Check it before going further: set an HLT target, and confirm it settles without
+oscillating or overshooting by more than a degree or so.
+
+**2. `DeltaTemp`** — start at 3 (C). Run a mash and watch the resting HLT
+temperature once the mash is holding target:
+
+| What you see | What it means | Do |
+|---|---|---|
+| HLT settles a degree or two above the mash and holds | correct | nothing |
+| Mash never reaches target; you get the "DeltaTemp may be too small" notification | the band cannot cover your heat loss | raise by 2 and repeat |
+| HLT sits pinned at `mash + DeltaTemp` the whole rest | same as above | raise by 2 and repeat |
+| Mash overshoots on arrival | band wider than needed | lower by 1 |
+
+The offset your rig needs depends on insulation, hose run and coil area, so there is
+no correct value to copy. What you are looking for is the smallest band that still
+lets the mash hold setpoint.
+
+**3. Outer loop (`P` / `I` / `D`)** — usually leave these alone. They are in
+**degrees of HLT offset per degree of mash error**, so `P = 2.0` means a 1 C mash
+error asks for 2 C of HLT offset, bounded by `DeltaTemp`.
+
+| Symptom | Change |
+|---|---|
+| Mash approaches target very slowly despite HLT having headroom | raise `P` to 3-4 |
+| Mash oscillates around target, HLT setpoint visibly hunting | lower `P` to 1.0-1.5 |
+| Mash holds slightly below target indefinitely | raise `I` to 0.01 |
+| Mash overshoots after a long ramp | lower `I`, or leave `D` at 0 |
+
+Leave `D` at 0 unless you have a specific reason. The inner loop already damps the
+response, and derivative on a cascaded outer loop mostly amplifies sensor noise.
+
+> ⚠️ Do not put AutoTune values in `P` / `I` / `D`. AutoTune produces heater-percent
+> gains; used here they saturate the outer loop at a few hundredths of a degree of
+> error, which pins the HLT at the top of the band and turns the cascade back into
+> fixed-offset control. The plugin warns if it sees a `P` above 20.
 
 ## Installation:
 - sudo pip3 install cbpi4-PIDHerms 
