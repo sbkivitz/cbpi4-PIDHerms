@@ -86,6 +86,15 @@ class PID_HERMS(CBPiKettleLogic):
     # changed, so starting clean is safer than resuming a stale bias.
     INTEGRAL_CARRY_MAX_AGE = 300
 
+    # How much the mash must rise for the ramp to count as still climbing.
+    # Small and unit-agnostic on purpose: the question is whether the ramp is
+    # moving at all, not how fast.
+    #
+    # Together with SATURATION_WARN_SECONDS this sets the slowest rise still
+    # counted as progress - 0.05 degrees per 900s, about 0.2 degrees an hour.
+    # Anything slower is a stall in every sense that matters to a brewer.
+    CLIMB_MIN_RISE = 0.05
+
     def __init__(self, cbpi, id, props):
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
@@ -93,6 +102,30 @@ class PID_HERMS(CBPiKettleLogic):
         self.work_time, self.rest_time, self.max_output_boil = None, None, None
         self.max_boil_temp, self.max_pid_temp, self.max_pump_temp = None, None, None
         self.kettle, self.heater, self.agitator = None, None, None
+
+    def _mash_is_climbing(self, current_temp):
+        """Has the mash risen measurably since the last confirmed rise?
+
+        Deliberately coarse. The question is whether the ramp is making headway
+        at all, not how fast - a rig pinned at the top of its band and still
+        climbing is working exactly as intended, however slowly.
+
+        The anchor only moves on a confirmed rise or on a new low, so a ramp
+        that gains less than CLIMB_MIN_RISE per sample still registers as
+        climbing once enough samples have accumulated, rather than being judged
+        sample-to-sample and dismissed.
+        """
+        threshold = self.CLIMB_MIN_RISE
+        anchor = getattr(self, "_climb_anchor", None)
+        if anchor is None or current_temp >= anchor + threshold:
+            self._climb_anchor = current_temp
+            return True
+        if current_temp < anchor:
+            # Going backwards is not climbing, and the new low is the anchor to
+            # judge any recovery against.
+            self._climb_anchor = current_temp
+            return False
+        return False
 
     def _restore_integral(self):
         """Pick the integral back up if this kettle was being controlled moments ago.
@@ -259,18 +292,39 @@ class PID_HERMS(CBPiKettleLogic):
                 # back toward mash_target, so at rest the HLT sits close to the mash.
                 hlt_setpoint = target_temp + self.pid.calc(current_temp, target_temp)
 
-                # If the outer loop has been asking for the full band for a long time
-                # and the mash is still short, the band itself is the limit: the rig
-                # needs a bigger HLT-to-mash offset than DeltaTemp allows.
-                if hlt_setpoint >= target_temp + self.delta - 1e-9 and current_temp < target_temp - 0.5:
+                # If the outer loop has been asking for the full band for a long
+                # time, the mash is still short, AND the mash has stopped rising,
+                # the band itself is the limit: the rig needs a bigger
+                # HLT-to-mash offset than DeltaTemp allows.
+                #
+                # The "stopped rising" part is what makes this a diagnosis rather
+                # than a nuisance. Any ramp from cold sits pinned at the top of
+                # the band for as long as the ramp takes - that is the band doing
+                # its job, not failing. Warning on saturation alone fired on
+                # every heat-up, and a warning that cries wolf gets ignored when
+                # it is finally right.
+                saturated = (
+                    hlt_setpoint >= target_temp + self.delta - 1e-9
+                    and current_temp < target_temp - 0.5
+                )
+                if saturated and self._mash_is_climbing(current_temp):
+                    # Pinned at the band limit, but the mash is still rising, so
+                    # the band is still delivering heat and there is nothing to
+                    # warn about. Reset rather than pause: an earlier version
+                    # only paused the clock here, which still accumulated on the
+                    # samples between confirmed rises and so warned partway
+                    # through every ordinary ramp - the exact false positive this
+                    # check exists to prevent.
+                    saturated_seconds = 0
+                elif saturated:
                     saturated_seconds += self.sample_time
                     if saturated_seconds >= self.SATURATION_WARN_SECONDS and not band_warning_sent:
                         band_warning_sent = True
                         self.cbpi.notify(
                             "PIDHerms",
                             "DeltaTemp ({}) may be too small for this system - the HLT "
-                            "has been held at its limit and the mash is still below "
-                            "target. Increase DeltaTemp if the mash cannot hold "
+                            "has been held at its limit and the mash has stopped short "
+                            "of target. Increase DeltaTemp if the mash cannot hold "
                             "setpoint.".format(self.delta),
                             NotificationType.WARNING,
                         )
