@@ -95,6 +95,17 @@ class PID_HERMS(CBPiKettleLogic):
     # Anything slower is a stall in every sense that matters to a brewer.
     CLIMB_MIN_RISE = 0.05
 
+    # How much hotter the HLT must be than the mash before heat is considered to
+    # be flowing. Small: the question is the direction of the gradient, not its
+    # size. A HERMS with the HLT half a degree above the mash is delivering, just
+    # slowly.
+    HEAT_FLOW_MARGIN = 0.5
+
+    #: Reported to anything that wants to know whether heat can reach the mash
+    #: right now - the step's heat-stall watch in particular. Starts True so a
+    #: logic that has not completed a cycle yet is not assumed broken.
+    heat_available = True
+
     def __init__(self, cbpi, id, props):
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
@@ -244,6 +255,29 @@ class PID_HERMS(CBPiKettleLogic):
             # current mash temperature and its target
             current_temp = self.get_sensor_value(self.kettle.sensor).get("value")
             target_temp = self.get_kettle_target_temp(self.id)
+
+            # Tell anything watching whether heat can actually reach the mash.
+            #
+            # There is no element in the mash tun - it is heated through a coil
+            # in the HLT - so while the HLT is at or below the mash temperature
+            # no heat flows, however hard the element is driven. That is the
+            # normal state for several minutes after every step change, when the
+            # target jumps and the HLT is still where the last rest left it: the
+            # mash drifts down, flattens, and only then begins to climb.
+            #
+            # Without this, the step's heat-stall watch reads that plateau as a
+            # dead element and warns at exactly the moment the rig is working
+            # hardest. Observed on a running rig: warned 21.5 F short of target,
+            # reached target half an hour of brewing time later having climbed
+            # the whole way.
+            try:
+                self.heat_available = (
+                    self.HLT_Temp is not None
+                    and current_temp is not None
+                    and self.HLT_Temp > float(current_temp) + self.HEAT_FLOW_MARGIN
+                )
+            except (TypeError, ValueError):
+                self.heat_available = True
 
             # Nothing else in this plugin bounds HLT temperature - Max_Boil_Temp,
             # Max_PID_Temp and Max_Pump_Temp are all evaluated against the mash
