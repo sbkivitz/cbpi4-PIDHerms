@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from cbpi.api import *
+from cbpi.api import clock
 from cbpi.api.dataclasses import NotificationType
 import time
 import datetime
@@ -59,6 +60,32 @@ class PID_HERMS(CBPiKettleLogic):
     # surface area, so it cannot be guessed - but it can be detected.
     SATURATION_WARN_SECONDS = 900
 
+    # Integral state carried across restarts of the same kettle's logic, keyed by
+    # kettle id, as {kettle_id: (brewing_time, outer_iTerm, inner_iTerm)}.
+    #
+    # A step transition tears the logic down and builds it again: MashInStep's
+    # on_stop() switches AutoMode off, which cancels this task, and the next
+    # step's on_start() switches it back on, which constructs a fresh one. Two
+    # consecutive rests on the same kettle at the same target therefore restart
+    # the controller for no reason.
+    #
+    # The integral is what holds the steady-state HLT-over-mash offset - roughly
+    # two degrees on a typical rig, purely to cover losses. A new instance starts
+    # at zero and has to rebuild it with I=0.005, which takes many minutes, and
+    # the mash sags for all of them. On a four-rest profile that is four dips,
+    # each at a rest boundary, each costing exactly the enzyme activity the rest
+    # exists to produce.
+    #
+    # Carried rather than persisted: this is live control state, not
+    # configuration, and it must not survive a restart of the server where the
+    # kettle may have gone cold.
+    _carried_integral = {}
+
+    # How long carried integral state stays usable, in brewing seconds. Beyond
+    # this the rig has probably been left alone and the thermal situation has
+    # changed, so starting clean is safer than resuming a stale bias.
+    INTEGRAL_CARRY_MAX_AGE = 300
+
     def __init__(self, cbpi, id, props):
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
@@ -66,6 +93,37 @@ class PID_HERMS(CBPiKettleLogic):
         self.work_time, self.rest_time, self.max_output_boil = None, None, None
         self.max_boil_temp, self.max_pid_temp, self.max_pump_temp = None, None, None
         self.kettle, self.heater, self.agitator = None, None, None
+
+    def _restore_integral(self):
+        """Pick the integral back up if this kettle was being controlled moments ago.
+
+        See _carried_integral. Silently starts clean if there is nothing recent to
+        resume, which is the safe direction: a missing bias costs a slow approach,
+        a wrong one costs an overshoot.
+        """
+        carried = self._carried_integral.get(self.id)
+        if not carried:
+            return
+        when, outer_i, inner_i = carried
+        age = clock.now() - when
+        if age < 0 or age > self.INTEGRAL_CARRY_MAX_AGE:
+            self._carried_integral.pop(self.id, None)
+            return
+        self.pid._iTerm = outer_i
+        self.hlt_pid._iTerm = inner_i
+        self._logger.info(
+            "PIDHerms: resuming integral state for kettle %s after %.0fs "
+            "(outer %.3f, inner %.3f)", self.id, age, outer_i, inner_i,
+        )
+
+    def _remember_integral(self):
+        """Hand the integral to whatever instance controls this kettle next."""
+        try:
+            self._carried_integral[self.id] = (
+                clock.now(), self.pid._iTerm, self.hlt_pid._iTerm,
+            )
+        except Exception as e:
+            self._logger.debug("Could not carry integral state: %s", e)
 
     def _float_prop(self, name, default):
         """Read a numeric property, falling back to default when it is missing, blank
@@ -101,24 +159,26 @@ class PID_HERMS(CBPiKettleLogic):
                 #switch the pump on
                 await self.actor_on(self.agitator)
                 # calculate time, when pump should do the next pause
-                off_time = time.time() + self.work_time
+                # Brewing seconds, like every other duration here - the clock
+                # decides how fast those pass.
+                off_time = clock.now() + self.work_time
                 # run pump until next pause time is reached
-                while time.time() < off_time:
-                    await asyncio.sleep(1)
+                while clock.now() < off_time:
+                    await clock.sleep(1)
                     # stop cycle, if current temp is higher than max pump temp
                     if self.get_sensor_value(self.kettle.sensor).get("value") >= self.max_pump_temp:
                         break
                 # pause pump when active pump Interval is completed
                 self._logger.debug("resting pump")
                 await self.actor_off(self.agitator)
-                await asyncio.sleep(self.rest_time)
+                await clock.sleep(self.rest_time)
             # If temeprature is above max pump temp, and pump is on, switch it off
             # Staops also the pump if user switches it on and temp is abouve max pump temp
             else:
                 if pump_on:
                     self._logger.debug("pump max temp reached, pump turned off")
                     await self.actor_off(self.agitator)
-                await asyncio.sleep(1)
+                await clock.sleep(1)
 
     # subroutine that controls temperature via a cascaded PID:
     #   outer (mash) PID -> clamped HLT setpoint -> inner (HLT) PID -> heater power
@@ -176,7 +236,7 @@ class PID_HERMS(CBPiKettleLogic):
                             "No HLT sensor reading - heater turned off",
                             NotificationType.ERROR,
                         )
-                await asyncio.sleep(self.sample_time)
+                await clock.sleep(self.sample_time)
                 continue
 
             hlt_read_failures = 0
@@ -247,7 +307,7 @@ class PID_HERMS(CBPiKettleLogic):
             if heater_is_on and heat_percent != heat_percent_old:
                 await self.actor_set_power(self.heater,heat_percent)
                 heat_percent_old = heat_percent
-            await asyncio.sleep(self.sample_time)
+            await clock.sleep(self.sample_time)
 
 
     async def run(self):
@@ -268,6 +328,23 @@ class PID_HERMS(CBPiKettleLogic):
 
             self.sample_time = int(self.props.get("SampleTime", 5))
             self.max_output = int(self.props.get("Max_Output", 100))
+
+            # A simulated rig runs its thermal model faster than real time. If the
+            # control loop kept deciding once every sample_time REAL seconds while
+            # the plant advanced sample_time * scale SIMULATED seconds between
+            # decisions, the closed loop under test would not be the one that runs
+            # on hardware - it would be the same rig sampled far too slowly, and it
+            # limit cycles accordingly.
+            #
+            # Timing goes through cbpi.api.clock rather than the wall clock, so this
+            # loop states its period in brewing seconds and has no idea whether it
+            # is being simulated. On hardware the clock is real time and this is
+            # exactly what it always was.
+            #
+            # Scaling each sleep here instead was the first attempt, and it put a
+            # simulator's config key into a hardware control path - a setting left
+            # at 60 would have run a real heater's integral sixty times fast.
+            pid_clock = lambda: clock.now() * 1000.0
 
             self.delta = self._float_prop("DeltaTemp", default_delta)
             if self.delta < min_delta:
@@ -300,14 +377,17 @@ class PID_HERMS(CBPiKettleLogic):
             # calc() returns its previous output until its own sample time has elapsed,
             # so a longer sample time here is all that is needed to slow the outer loop.
             self.pid = PIDArduino(
-                self.sample_time * self.OUTER_LOOP_RATIO, p, i, d, 0, self.delta
+                self.sample_time * self.OUTER_LOOP_RATIO, p, i, d, 0, self.delta,
+                getTimeMs=pid_clock
             )
 
             # Inner loop: HLT error -> heater percent. These are the AutoTune-style gains.
             hp = self._float_prop("HLT_P", 117.0795)
             hi = self._float_prop("HLT_I", 0.2747)
             hd = self._float_prop("HLT_D", 41.58)
-            self.hlt_pid = PIDArduino(self.sample_time, hp, hi, hd, 0, self.max_output)
+            self.hlt_pid = PIDArduino(self.sample_time, hp, hi, hd, 0, self.max_output,
+                                      getTimeMs=pid_clock)
+            self._restore_integral()
 
             self.work_time = float(self.props.get("Rest_Interval", 600))
             self.rest_time = float(self.props.get("Rest_Time", 60))
@@ -353,6 +433,10 @@ class PID_HERMS(CBPiKettleLogic):
             logging.error("PIDHerms Error {}".format(e))
         finally:
             self.running = False
+            # Hand the integral on before shutting down, so the next instance to
+            # control this kettle - usually the very next step in the profile -
+            # does not have to rebuild the steady-state offset from nothing.
+            self._remember_integral()
             await self.actor_off(self.heater)
 
 # Based on Arduino PID Library
@@ -380,9 +464,15 @@ class PIDArduino(object):
         self._outputMin = outputMin
         self._outputMax = outputMax
         self._iTerm = 0
-        self._lastInput = 0
+        # None, not 0, so the first calc() can seed it from the real reading.
+        # Starting at 0 made the first derivative term -(Kd * inputValue): with a
+        # kettle at 152 F and Kd 23.1 that is about -3500, which clamps the output
+        # to zero. Every fresh controller therefore commanded the heater OFF for
+        # its first sample, and the kettle logic is rebuilt at every step
+        # transition, so that happened at every rest boundary of every brew.
+        self._lastInput = None
         self._lastOutput = 0
-        self._lastCalc = 0
+        self._lastCalc = None
 
         if getTimeMs is None:
             self._getTimeMs = self._currentTimeMs
@@ -392,15 +482,28 @@ class PIDArduino(object):
     def calc(self, inputValue, setpoint):
         now = self._getTimeMs()
 
-        if (now - self._lastCalc) < self._sampleTime:
+        # First call: seed the history from the reading in hand rather than from
+        # zero, and answer immediately instead of waiting out a sample period.
+        if self._lastCalc is None:
+            self._lastInput = inputValue
+            self._lastCalc = now
+        elif (now - self._lastCalc) < self._sampleTime:
             return self._lastOutput
 
         # Compute all the working error variables
         error = setpoint - inputValue
         dInput = inputValue - self._lastInput
 
-        # In order to prevent windup, only integrate if the process is not saturated
-        if self._lastOutput < self._outputMax and self._lastOutput > self._outputMin:
+        # Anti-windup: stop integrating only when the integral is pushing further
+        # into the rail it is already against. Freezing whenever the output was
+        # saturated - regardless of direction - meant a controller that had
+        # bottomed out could not begin recovering until the proportional term
+        # alone lifted it off the rail, which on a slow thermal plant is a long
+        # steady-state error.
+        at_ceiling = self._lastOutput >= self._outputMax
+        at_floor = self._lastOutput <= self._outputMin
+        winding_up = (at_ceiling and error > 0) or (at_floor and error < 0)
+        if not winding_up:
             self._iTerm += self._Ki * error
             self._iTerm = min(self._iTerm, self._outputMax)
             self._iTerm = max(self._iTerm, self._outputMin)
