@@ -3,6 +3,7 @@ import logging
 from cbpi.api import *
 from cbpi.api import clock
 from cbpi.api.dataclasses import NotificationType
+import math
 import time
 import datetime
 
@@ -25,15 +26,17 @@ import datetime
              Property.Select(label="SampleTime", options=[2,5], 
                              description="PID Sample time in seconds. Default: 5 (How often is the output calculation done)"),
              Property.Number(label="Max_Pump_Temp", configurable=True, default_value=88,
-                             description="Max temp the pump can work in."),
+                             description="Max temp the pump can work in. Interpreted in the configured temperature unit; the default is 88 C / 190.4 F."),
              Property.Number(label = "Max_Output", configurable = True, default_value = 100, 
                              description="Max power for PID and Ramp up."),
              Property.Number(label="Max_Boil_Output", configurable=True, default_value=85,
                              description="Power when Max Boil Temperature is reached."),
              Property.Number(label="Max_Boil_Temp", configurable=True, default_value=98,
-                             description="When Temperature reaches this, power will be reduced to Max Boil Output."),
+                             description="When Temperature reaches this, power will be reduced to Max Boil Output. Interpreted in the configured temperature unit; the default is 98 C / 208.4 F."),
              Property.Number(label="Max_PID_Temp", configurable=True,
                              description="When this temperature is reached, PID will be turned off"),
+             Property.Number(label="Sensor_Stale_Seconds", configurable=True, default_value=300,
+                             description="Seconds a mash or HLT sensor may repeat the exact same numeric value before heating is suspended. Default: 300 seconds."),
              Property.Number(label="Rest_Interval", configurable=True, default_value=600,
                              description="Rest the pump after this many seconds during the mash."),
              Property.Number(label="Rest_Time", configurable=True, default_value=60,
@@ -50,6 +53,18 @@ class PID_HERMS(CBPiKettleLogic):
     OUTER_LOOP_RATIO = 5
     # Consecutive failed HLT reads tolerated before the heater is cut.
     MAX_HLT_READ_FAILURES = 5
+    # Fallback if an older core does not tell us a sensor-specific max_age.
+    MAX_SENSOR_AGE = 30
+    # Exact repeated values are weaker evidence than sensor age because a mash
+    # at rest can legitimately sit on one quantised reading for a while. Five
+    # minutes is still far longer than the 15s/30s source-age conventions, but
+    # bounds a frozen mash probe before an active HERMS can drift badly.
+    DEFAULT_SENSOR_STALE_SECONDS = 300
+    # DS18B20 12-bit resolution is 0.0625 C, or 0.1125 F. Treat adjacent
+    # quantised values as unchanged so a probe flapping one count cannot reset
+    # the stale timer forever.
+    SENSOR_REPEAT_EPSILON_C = 0.07
+    SENSOR_REPEAT_EPSILON_F = 0.12
     # Consecutive zero-demand samples before the heater actor is switched off
     # rather than merely held at 0%. Purely to stop a PID sitting at zero from
     # chattering a contactor - at 0% duty no heat is produced either way.
@@ -194,6 +209,8 @@ class PID_HERMS(CBPiKettleLogic):
         self.kettle, self.heater, self.agitator = None, None, None
         self._hlt_kettle = None
         self._hlt_target_before = None
+        self._sensor_watch = {}
+        self.sensor_stale_seconds = self.DEFAULT_SENSOR_STALE_SECONDS
         self.pump_rest_enabled = True
 
     def _mash_is_climbing(self, current_temp):
@@ -232,7 +249,11 @@ class PID_HERMS(CBPiKettleLogic):
             return
         when, outer_i, inner_i = carried
         age = clock.now() - when
-        if age < 0 or age > self.INTEGRAL_CARRY_MAX_AGE:
+        if (
+            age < 0 or age > self.INTEGRAL_CARRY_MAX_AGE
+            or not math.isfinite(float(outer_i))
+            or not math.isfinite(float(inner_i))
+        ):
             self._carried_integral.pop(self.id, None)
             return
         self.pid._iTerm = outer_i
@@ -245,6 +266,12 @@ class PID_HERMS(CBPiKettleLogic):
     def _remember_integral(self):
         """Hand the integral to whatever instance controls this kettle next."""
         try:
+            if (
+                not math.isfinite(float(self.pid._iTerm))
+                or not math.isfinite(float(self.hlt_pid._iTerm))
+            ):
+                self._carried_integral.pop(self.id, None)
+                return
             self._carried_integral[self.id] = (
                 clock.now(), self.pid._iTerm, self.hlt_pid._iTerm,
             )
@@ -264,6 +291,161 @@ class PID_HERMS(CBPiKettleLogic):
                 "PIDHerms: could not parse %s=%r, using %s", name, value, default
             )
             return float(default)
+
+    def _temp_default(self, celsius):
+        """Return a temperature default in the configured unit."""
+        celsius = float(celsius)
+        if getattr(self, "TEMP_UNIT", "C") == "C":
+            return celsius
+        return celsius * 9.0 / 5.0 + 32.0
+
+    def _temperature_prop(self, name, celsius_default):
+        """Read a temperature property whose historical metadata default was Celsius.
+
+        CraftBeerPi stores plugin defaults in props, so a Fahrenheit install can
+        arrive here with Max_Boil_Temp='98' even though 98 was meant as Celsius.
+        Treat the exact historical Celsius default as unset on non-Celsius
+        systems; any other configured value is the brewer's value in their
+        configured unit.
+        """
+        default = self._temp_default(celsius_default)
+        value = self.props.get(name, None)
+        if value is None or str(value).strip() == "":
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "PIDHerms: could not parse %s=%r, using %.1f %s",
+                name, value, default, getattr(self, "TEMP_UNIT", ""),
+            )
+            return default
+        if getattr(self, "TEMP_UNIT", "C") != "C" and abs(parsed - float(celsius_default)) < 1e-9:
+            self._logger.warning(
+                "PIDHerms: %s=%s is the old Celsius default on a %s system; "
+                "using %.1f %s instead",
+                name, value, self.TEMP_UNIT, default, self.TEMP_UNIT,
+            )
+            return default
+        return parsed
+
+    def _delta_prop(self):
+        """Read DeltaTemp, converting the historical Celsius default on F rigs.
+
+        DeltaTemp is a temperature difference, so the conversion is a scale
+        factor only: 3 C of HERMS band is 5.4 F, not 37.4 F.
+        """
+        default = 3.0 if getattr(self, "TEMP_UNIT", "C") == "C" else 5.4
+        value = self.props.get("DeltaTemp", None)
+        if value is None or str(value).strip() == "":
+            return default
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            self._logger.warning(
+                "PIDHerms: could not parse DeltaTemp=%r, using %.1f %s",
+                value, default, getattr(self, "TEMP_UNIT", ""),
+            )
+            return default
+        if getattr(self, "TEMP_UNIT", "C") != "C" and abs(parsed - 3.0) < 1e-9:
+            self._logger.warning(
+                "PIDHerms: DeltaTemp=3 is the old Celsius default on a %s system; "
+                "using %.1f %s instead",
+                self.TEMP_UNIT, default, self.TEMP_UNIT,
+            )
+            return default
+        return parsed
+
+    def _read_trusted_temp(self, sensor_id, label):
+        """Return (temperature, reason) where reason explains why it is unsafe.
+
+        A numeric value alone is not enough: some sensor drivers keep publishing
+        their last value after a failed read. Core exposes `age` for drivers that
+        can say when they last changed, and the repeated-value watch here covers
+        drivers that keep resetting that age around a frozen number.
+        """
+        if not sensor_id:
+            return None, "{} sensor is not configured".format(label)
+
+        try:
+            state = self.get_sensor_value(sensor_id)
+            value = float(state.get("value"))
+        except (AttributeError, TypeError, ValueError):
+            return None, "No {} sensor reading".format(label)
+        if not math.isfinite(value):
+            return None, "{} sensor reading is not finite".format(label)
+
+        age = state.get("age")
+        if age is not None:
+            try:
+                age = float(age)
+                if not math.isfinite(age):
+                    age = None
+            except (TypeError, ValueError):
+                age = None
+        max_age = state.get("max_age")
+        if max_age is not None:
+            try:
+                max_age = float(max_age)
+                if not math.isfinite(max_age):
+                    max_age = None
+            except (TypeError, ValueError):
+                max_age = None
+        if not max_age or max_age <= 0:
+            max_age = self.MAX_SENSOR_AGE
+        if age is not None and age > max_age:
+            return None, "{} sensor last updated {:.0f}s ago (limit {:.0f}s)".format(
+                label, age, max_age
+            )
+        if age is None:
+            return value, None
+
+        try:
+            if not isinstance(getattr(self, "_sensor_watch", None), dict):
+                self._sensor_watch = {}
+            stale_seconds = float(getattr(
+                self, "sensor_stale_seconds", self.DEFAULT_SENSOR_STALE_SECONDS
+            ))
+            if stale_seconds <= 0:
+                stale_seconds = self.DEFAULT_SENSOR_STALE_SECONDS
+
+            timestamp = state.get("timestamp")
+            try:
+                now = float(timestamp)
+            except (TypeError, ValueError):
+                # SensorController timestamps and ages in wall-clock seconds.
+                # Use the same clock for this freshness watch on hardware; tests
+                # and simulators that want accelerated time can provide their own
+                # timestamp in the sensor state they feed to this consumer.
+                now = time.time()
+            key = sensor_id
+            watched = self._sensor_watch.get(key)
+            epsilon = (
+                self.SENSOR_REPEAT_EPSILON_C
+                if getattr(self, "TEMP_UNIT", "C") == "C"
+                else self.SENSOR_REPEAT_EPSILON_F
+            )
+            watched_value = None if watched is None else float(watched["value"])
+            if (
+                watched is None
+                or not math.isfinite(watched_value)
+                or abs(watched_value - value) > epsilon
+            ):
+                self._sensor_watch[key] = {"value": value, "changed_at": now}
+                return value, None
+
+            unchanged_for = now - watched["changed_at"]
+            if unchanged_for > stale_seconds:
+                return None, (
+                    "{} sensor has been unchanged at {:.2f} for {:.0f}s "
+                    "(limit {:.0f}s)"
+                ).format(label, value, unchanged_for, stale_seconds)
+        except Exception as e:  # noqa: BLE001
+            getattr(self, "_logger", logging.getLogger(type(self).__name__)).error(
+                "PIDHerms: cannot validate %s sensor freshness: %s", label, e
+            )
+            return None, "{} sensor freshness could not be validated".format(label)
+        return value, None
 
     async def on_stop(self):
         await self.actor_off(self.agitator)
@@ -349,21 +531,23 @@ class PID_HERMS(CBPiKettleLogic):
         heater_is_on = False
         zero_demand_samples = 0
         heat_percent_old = 0
-        hlt_read_failures = 0
-        hlt_fault_notified = False
+        sensor_fault_notified = None
         saturated_seconds = 0
         band_warning_sent = False
 
         while self.running:
-            try:
-                hlt_value = self.get_sensor_value(self.sensor).get("value")
-                self.HLT_Temp = float(hlt_value)
-            except (TypeError, ValueError, AttributeError):
-                self.HLT_Temp = None
+            self.HLT_Temp, hlt_fault = self._read_trusted_temp(self.sensor, "HLT")
 
             # current mash temperature and its target
-            current_temp = self.get_sensor_value(self.kettle.sensor).get("value")
-            target_temp = self.get_kettle_target_temp(self.id)
+            current_temp, mash_fault = self._read_trusted_temp(
+                self.kettle.sensor, "Mash"
+            )
+            try:
+                target_temp = float(self.get_kettle_target_temp(self.id))
+                if not math.isfinite(target_temp):
+                    target_temp = None
+            except (TypeError, ValueError):
+                target_temp = None
 
             # Tell anything watching whether heat can actually reach the mash.
             #
@@ -400,35 +584,46 @@ class PID_HERMS(CBPiKettleLogic):
             except (TypeError, ValueError):
                 self.heat_available = True
 
-            # Nothing else in this plugin bounds HLT temperature - Max_Boil_Temp,
-            # Max_PID_Temp and Max_Pump_Temp are all evaluated against the mash
-            # sensor. So a missing HLT reading has to be handled before any
-            # heating decision, not only inside the PID branch: during a mashout
-            # or boil ramp the branches below command full power unconditionally,
-            # and would otherwise drive the element blind indefinitely.
-            if self.HLT_Temp is None:
-                hlt_read_failures += 1
-                if hlt_read_failures <= self.MAX_HLT_READ_FAILURES:
-                    # Ride out a momentary 1-wire glitch on the last known power.
-                    heat_percent = heat_percent_old
-                else:
-                    heat_percent = 0
-                    await self.actor_off(self.heater)
-                    heater_is_on = False
-                    zero_demand_samples = 0
-                    heat_percent_old = 0
-                    if not hlt_fault_notified:
-                        hlt_fault_notified = True
-                        self.cbpi.notify(
-                            "PIDHerms",
-                            "No HLT sensor reading - heater turned off",
-                            NotificationType.ERROR,
-                        )
+            sensor_fault = hlt_fault or mash_fault
+            sensor_fault_key = "hlt" if hlt_fault else "mash" if mash_fault else None
+            if target_temp is None:
+                sensor_fault = sensor_fault or "Mash target temperature is missing"
+                sensor_fault_key = sensor_fault_key or "target"
+
+            # Nothing else in this plugin can make a safe heating decision
+            # without both temperatures. Do not ride out bad samples on the last
+            # known power: a repeated last value is exactly the dangerous fault.
+            if sensor_fault:
+                self.heat_available = False
+                await self.actor_off(self.heater)
+                heater_is_on = False
+                zero_demand_samples = 0
+                heat_percent_old = 0
+                if target_temp is not None:
+                    await self._publish_hlt_setpoint(target_temp)
+                elif getattr(self, "_hlt_target_before", None) is not None:
+                    await self._publish_hlt_setpoint(self._hlt_target_before)
+                if sensor_fault_notified != sensor_fault_key:
+                    sensor_fault_notified = sensor_fault_key
+                    message = "{} - heater turned off".format(sensor_fault)
+                    getattr(self, "_logger", logging.getLogger(type(self).__name__)).error(
+                        "PIDHerms: %s", message
+                    )
+                    self.cbpi.notify(
+                        "PIDHerms",
+                        message,
+                        NotificationType.ERROR,
+                    )
                 await clock.sleep(self.sample_time)
                 continue
 
-            hlt_read_failures = 0
-            hlt_fault_notified = False
+            if sensor_fault_notified is not None:
+                self.cbpi.notify(
+                    "PIDHerms",
+                    "Temperature readings restored - heating resumed",
+                    NotificationType.INFO,
+                )
+            sensor_fault_notified = None
 
             # if current temperature is higher than the defined boil temp, use a fixed
             # heating percent instead of PID values for controlled boiling
@@ -549,10 +744,6 @@ class PID_HERMS(CBPiKettleLogic):
         self._logger = logging.getLogger(type(self).__name__)
         try:
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
-            boilthreshold = 98 if self.TEMP_UNIT == "C" else 208
-            maxpidtemp = 88 if self.TEMP_UNIT == "C" else 190
-            maxpumptemp = 88 if self.TEMP_UNIT == "C" else 190
-            default_delta = 3 if self.TEMP_UNIT == "C" else 5
             # A HERMS only moves heat while the HLT is hotter than the wort. A zero or
             # negative band leaves the outer loop no authority at all, so the mash would
             # never reach target. Hold a small floor rather than stalling. This floor
@@ -581,7 +772,7 @@ class PID_HERMS(CBPiKettleLogic):
             # at 60 would have run a real heater's integral sixty times fast.
             pid_clock = lambda: clock.now() * 1000.0
 
-            self.delta = self._float_prop("DeltaTemp", default_delta)
+            self.delta = self._delta_prop()
             if self.delta < min_delta:
                 logging.warning(
                     "PIDHerms: DeltaTemp %s is below the usable minimum for a HERMS, "
@@ -634,9 +825,19 @@ class PID_HERMS(CBPiKettleLogic):
             self.pump_rest_enabled = self.props.get("Pump_Rest", "Yes") != "No"
             self.max_output_boil = float(self.props.get("Max_Boil_Output", 85))
 
-            self.max_boil_temp = float(self.props.get("Max_Boil_Temp", boilthreshold))
-            self.max_pid_temp = float(self.props.get("Max_PID_Temp", maxpidtemp))
-            self.max_pump_temp = float(self.props.get("Max_Pump_Temp", maxpumptemp))
+            self.sensor_stale_seconds = self._float_prop(
+                "Sensor_Stale_Seconds", self.DEFAULT_SENSOR_STALE_SECONDS
+            )
+            if self.sensor_stale_seconds <= 0:
+                logging.warning(
+                    "PIDHerms: Sensor_Stale_Seconds %s is not positive, using %s",
+                    self.sensor_stale_seconds, self.DEFAULT_SENSOR_STALE_SECONDS
+                )
+                self.sensor_stale_seconds = self.DEFAULT_SENSOR_STALE_SECONDS
+
+            self.max_boil_temp = self._temperature_prop("Max_Boil_Temp", 98)
+            self.max_pid_temp = self._temperature_prop("Max_PID_Temp", 88)
+            self.max_pump_temp = self._temperature_prop("Max_Pump_Temp", 88)
 
             self.kettle = self.get_kettle(self.id)
             self.heater = self.kettle.heater
