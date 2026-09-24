@@ -37,7 +37,11 @@ import datetime
              Property.Number(label="Rest_Interval", configurable=True, default_value=600,
                              description="Rest the pump after this many seconds during the mash."),
              Property.Number(label="Rest_Time", configurable=True, default_value=60,
-                             description="Rest the pump for this many seconds every rest interval.")])
+                             description="Rest the pump for this many seconds every rest interval."),
+             Property.Select(label="Pump_Rest", options=["Yes", "No"],
+                             description="Rest the pump periodically. No runs it continuously - the coil then never sits full of static wort."),
+             Property.Kettle(label="HLT_Kettle",
+                             description="The HLT, so its setpoint shows what this cascade is commanding. Optional.")])
 
 class PID_HERMS(CBPiKettleLogic):
 
@@ -106,6 +110,74 @@ class PID_HERMS(CBPiKettleLogic):
     #: logic that has not completed a cycle yet is not assumed broken.
     heat_available = True
 
+    def _pump_is_running(self):
+        """Is wort actually moving through the coil right now?
+
+        A HERMS coil transfers heat only while the mash is being recirculated.
+        With no agitator configured the rig is assumed to circulate some other
+        way, which keeps a differently-plumbed system behaving as it did.
+        """
+        # getattr, not direct access: this can be reached before run() has
+        # assigned the agitator, and a temperature controller must not fall over
+        # because it asked about a pump too early.
+        agitator = getattr(self, "agitator", None)
+        if not agitator:
+            return True
+        try:
+            pump = self.cbpi.actor.find_by_id(agitator)
+            return bool(pump is not None and pump.instance is not None
+                        and pump.instance.state)
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _find_hlt_kettle(self):
+        """The kettle whose setpoint should show what this cascade is asking for.
+
+        While a HERMS mash is running, the HLT is not being controlled to its
+        own configured target - it is being driven to whatever offset the outer
+        loop currently wants. The interface still showed the configured number,
+        which during a mash is stale and means nothing: a brewer looking at the
+        HLT sees 168.8 while the cascade is actually asking for 157.
+
+        Named explicitly by HLT_Kettle when set. Otherwise found by matching the
+        HLT sensor, which is the same sensor the inner loop already reads, so a
+        rig that is wired sensibly needs no extra configuration.
+        """
+        kettle_id = self.props.get("HLT_Kettle", None)
+        try:
+            if kettle_id:
+                return self.cbpi.kettle.find_by_id(kettle_id)
+            sensor_id = self.props.get("HLT_Sensor", None)
+            if not sensor_id:
+                return None
+            for item in self.cbpi.kettle.data:
+                # Never this kettle: the mash tun's own setpoint is the rest
+                # temperature and must keep saying so.
+                if item.id != self.id and item.sensor == sensor_id:
+                    return item
+        except Exception as e:
+            self._logger.warning("PIDHerms: could not find the HLT kettle: %s", e)
+        return None
+
+    async def _publish_hlt_setpoint(self, value):
+        """Show the commanded HLT setpoint in the interface.
+
+        Pushed over the websocket rather than saved. This is a transient
+        commanded value, not the brewer's configuration: writing it to disk
+        every sample would wear the card for nothing and would quietly overwrite
+        the number they actually set. on_stop puts the original back.
+        """
+        if getattr(self, "_hlt_kettle", None) is None:
+            return
+        rounded = round(float(value), 1)
+        if self._hlt_kettle.target_temp == rounded:
+            return
+        self._hlt_kettle.target_temp = rounded
+        try:
+            await self.cbpi.kettle.push_udpate()
+        except Exception as e:
+            self._logger.warning("PIDHerms: could not push the HLT setpoint: %s", e)
+
     def __init__(self, cbpi, id, props):
         super().__init__(cbpi, id, props)
         self._logger = logging.getLogger(type(self).__name__)
@@ -113,6 +185,9 @@ class PID_HERMS(CBPiKettleLogic):
         self.work_time, self.rest_time, self.max_output_boil = None, None, None
         self.max_boil_temp, self.max_pid_temp, self.max_pump_temp = None, None, None
         self.kettle, self.heater, self.agitator = None, None, None
+        self._hlt_kettle = None
+        self._hlt_target_before = None
+        self.pump_rest_enabled = True
 
     def _mash_is_climbing(self, current_temp):
         """Has the mash risen measurably since the last confirmed rise?
@@ -185,6 +260,20 @@ class PID_HERMS(CBPiKettleLogic):
 
     async def on_stop(self):
         await self.actor_off(self.agitator)
+        # Give the HLT its own setpoint back. While the cascade was running its
+        # displayed target was whatever the outer loop was commanding; leaving
+        # that behind would silently replace the number the brewer configured.
+        if getattr(self, "_hlt_kettle", None) is not None and \
+                getattr(self, "_hlt_target_before", None) is not None:
+            self._hlt_kettle.target_temp = self._hlt_target_before
+            try:
+                await self.cbpi.kettle.push_udpate()
+            except Exception as e:
+                self._logger.warning(
+                    "PIDHerms: could not restore the HLT setpoint: %s", e
+                )
+        self._hlt_kettle = None
+        self._hlt_target_before = None
     
     # subroutine that controlls pump aue and ump stop if max pump temp is reached
     async def pump_control(self):
@@ -212,6 +301,19 @@ class PID_HERMS(CBPiKettleLogic):
                     # stop cycle, if current temp is higher than max pump temp
                     if self.get_sensor_value(self.kettle.sensor).get("value") >= self.max_pump_temp:
                         break
+
+                # Rests are optional. The pumps on plenty of rigs are rated for
+                # continuous duty, and the rest is not free: while it is resting
+                # the coil holds static wort against hot liquor, which is why
+                # the HLT setpoint is clamped during a rest. A brewer who does
+                # not need the rest should not pay for it.
+                #
+                # Upstream documents these two fields only by restating their
+                # names, with no stated rationale, so "off" is a perfectly
+                # reasonable thing to want.
+                if not self.pump_rest_enabled:
+                    continue
+
                 # pause pump when active pump Interval is completed
                 self._logger.debug("resting pump")
                 await self.actor_off(self.agitator)
@@ -271,8 +373,20 @@ class PID_HERMS(CBPiKettleLogic):
             # reached target half an hour of brewing time later having climbed
             # the whole way.
             try:
+                # Two conditions, not one. A gradient is necessary but not
+                # sufficient: the coil only moves heat while wort is actually
+                # being pumped through it, so during the pump's rest interval -
+                # a minute in every ten on a typical configuration - the mash is
+                # thermally isolated no matter how hot the HLT is.
+                #
+                # Without the pump term the stall watch counts those rests as
+                # time the mash should have been rising, which is the same
+                # mistake in miniature as the one that made it warn during a
+                # step change.
+                pumping = self._pump_is_running()
                 self.heat_available = (
-                    self.HLT_Temp is not None
+                    pumping
+                    and self.HLT_Temp is not None
                     and current_temp is not None
                     and self.HLT_Temp > float(current_temp) + self.HEAT_FLOW_MARGIN
                 )
@@ -325,6 +439,32 @@ class PID_HERMS(CBPiKettleLogic):
                 # mash_target + DeltaTemp; as the mash nears its target the offset eases
                 # back toward mash_target, so at rest the HLT sits close to the mash.
                 hlt_setpoint = target_temp + self.pid.calc(current_temp, target_temp)
+
+                # No flow means no reason to be hotter than the mash wants.
+                #
+                # pump_control() and temp_control() are independent tasks that
+                # never talk to each other, so during the pump's rest the outer
+                # loop carried on asking for mash_target + DeltaTemp. The wort
+                # trapped in the coil has no flow and a lot of surface area
+                # against hot liquor, so it heads for HLT temperature - and a
+                # slug of overheated wort is pushed into the mash when the pump
+                # restarts. On a sixty minute rest with the default one-minute
+                # rest in every ten, that happens five times.
+                #
+                # Clamping to the mash target while nothing is moving means the
+                # trapped wort tends towards exactly the temperature it is
+                # supposed to be. It costs a little ramp rate, which is the
+                # right trade: there is no benefit to superheating static wort,
+                # and a brewer who wants a faster ramp should shorten the rest
+                # rather than cook the coil.
+                if not self._pump_is_running():
+                    hlt_setpoint = min(hlt_setpoint, target_temp)
+
+                # Show it. While the cascade is running the HLT is not being
+                # held at its own configured target, it is being driven to this
+                # - so displaying the configured number is worse than useless,
+                # it is a plausible-looking lie.
+                await self._publish_hlt_setpoint(hlt_setpoint)
 
                 # If the outer loop has been asking for the full band for a long
                 # time, the mash is still short, AND the mash has stopped rising,
@@ -479,6 +619,12 @@ class PID_HERMS(CBPiKettleLogic):
 
             self.work_time = float(self.props.get("Rest_Interval", 600))
             self.rest_time = float(self.props.get("Rest_Time", 60))
+            # Defaults to resting, so an existing configuration behaves exactly
+            # as it did. A rest time of zero also disables it, but only after
+            # switching the pump off and straight back on again every interval,
+            # which is a needless contactor cycle - this skips the rest
+            # entirely.
+            self.pump_rest_enabled = self.props.get("Pump_Rest", "Yes") != "No"
             self.max_output_boil = float(self.props.get("Max_Boil_Output", 85))
 
             self.max_boil_temp = float(self.props.get("Max_Boil_Temp", boilthreshold))
@@ -489,6 +635,16 @@ class PID_HERMS(CBPiKettleLogic):
             self.heater = self.kettle.heater
             self.agitator = self.kettle.agitator
             self.sensor = self.props.get("HLT_Sensor", None)
+
+            # Remember the HLT's own setpoint before the cascade starts
+            # overwriting the displayed one, so on_stop can put it back.
+            self._hlt_kettle = self._find_hlt_kettle()
+            if self._hlt_kettle is not None:
+                self._hlt_target_before = self._hlt_kettle.target_temp
+                logging.info(
+                    "PIDHerms: publishing the commanded setpoint to '%s' "
+                    "(was %s)", self._hlt_kettle.name, self._hlt_target_before
+                )
 
             logging.info(
                 "PIDHerms outer P:{} I:{} D:{} band:{} / inner P:{} I:{} D:{} {} {}".format(
