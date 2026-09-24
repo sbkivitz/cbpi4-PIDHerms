@@ -11,6 +11,8 @@ import datetime
                              description="Sensor of HLT Kettle"),
              Property.Number(label="DeltaTemp", configurable=True, default_value=3,
                              description="Width of the HLT overshoot band, in the configured temperature unit. The mash (outer) PID raises the HLT setpoint up to mash_target + DeltaTemp when it wants heat, and eases it back toward mash_target as the mash reaches setpoint, so at rest the HLT sits close to the mash temperature. A HERMS only moves heat while the HLT is hotter than the wort, so this must be greater than 0; values of 0 or less are raised to a small floor. System-dependent (insulation, hose length/run, HERMS coil surface area and efficiency) - tune it to your rig. Lower tracks the mash more tightly and is gentler on enzymes but ramps slower; higher ramps faster but risks denaturing enzymes in the coil."),
+             Property.Number(label="MashIn_DeltaTemp", configurable=True,
+                             description="Width of the HLT overshoot band while the mash tun holds only water, i.e. during Mash In before the grain goes in. DeltaTemp is a compromise between ramp rate and not cooking enzymes in the coil - but there are no enzymes in the tun yet, so that compromise is being paid for nothing. Measured on a 30 L / 6.5 kW HERMS heating tap water to a 163 F strike: at DeltaTemp 5.4 F the ramp takes 64 min and 13.6 of those are spent on the final 5 F; at 12 F it is 54 min with 5.2 on the final 5 F. Returns flatten past about 18 F because the element saturates. Leave blank to use DeltaTemp and change nothing. The wider band applies only from the start of Mash In until strike temperature is reached, which is exactly the window in which the tun is known to be grain-free."),
              Property.Number(label="P", configurable=True, default_value=2.0,
                              description="P value of the mash (outer) PID, in degrees of HLT offset per degree of mash error. NOTE: these are NOT heater-percent gains and must not be taken from the PID AutoTune plugin - use HLT_P/HLT_I/HLT_D for that."),
              Property.Number(label="I", configurable=True, default_value=0.005,
@@ -470,6 +472,25 @@ class PID_HERMS(CBPiKettleLogic):
         self.pump = self.cbpi.actor.find_by_id(self.agitator)
 
         while self.running:
+            # A step can ask for no flow at all.
+            #
+            # Mash-in does, the moment strike temperature is reached: grain
+            # should go into a still tun, not be pulled into a coil that has no
+            # grain bed in front of it yet. It is also what makes a flat-out
+            # mash-in ramp safe. The coil is the only path from the HLT to the
+            # mash, so stopping the pump cuts that path immediately - measured
+            # on this plant, a full-authority ramp overshoots strike by 3.0 F
+            # with the pump running and by -0.1 F with it stopped. An element
+            # cannot do that, because an element coasts.
+            if getattr(self, "pump_hold", False):
+                try:
+                    if (self.pump is not None and self.pump.instance
+                            and self.pump.instance.state):
+                        await self.actor_off(self.agitator)
+                except Exception as e:  # noqa: BLE001
+                    self._logger.error("pump hold could not stop the pump: %s", e)
+                await clock.sleep(1)
+                continue
             # get current pump status
             if self.pump.instance:
                 pump_on = self.pump.instance.state
@@ -634,6 +655,36 @@ class PID_HERMS(CBPiKettleLogic):
                 heat_percent = self.max_output
             # mash/PID band: cascade control
             else:
+                # The band is only a compromise while there is something in the
+                # tun worth protecting. During mash-in the tun holds water, so
+                # the outer loop is allowed a wider HLT-over-mash offset and the
+                # final approach stops crawling. MashInStep clears grain_present
+                # at its start and sets it the moment strike temperature is
+                # reached, which is exactly the grain-free window.
+                #
+                # Every attribute here is read with a default. run() sets them,
+                # but not every caller goes through run() - the test suites
+                # construct this object directly, and so can a plugin. A band
+                # optimisation must never be the reason the mash control loop
+                # dies.
+                active_band = getattr(self, "_active_band", self.delta)
+                wanted_band = (
+                    self.delta if getattr(self, "grain_present", True)
+                    else getattr(self, "mashin_delta", self.delta)
+                )
+                if wanted_band != active_band:
+                    try:
+                        self.pid.set_output_max(wanted_band)
+                        self._active_band = active_band = wanted_band
+                        logging.info(
+                            "PIDHerms: HLT band now %s %s (%s)",
+                            wanted_band, self.TEMP_UNIT,
+                            "grain in" if getattr(self, "grain_present", True)
+                            else "water only",
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logging.error("PIDHerms: could not change band: %s", e)
+
                 # Outer loop: the mash PID's output IS the HLT setpoint offset, in
                 # degrees, and the PID itself bounds it to [0, DeltaTemp]. Because the
                 # band limit and the PID's anti-windup boundary are the same value, the
@@ -680,7 +731,7 @@ class PID_HERMS(CBPiKettleLogic):
                 # every heat-up, and a warning that cries wolf gets ignored when
                 # it is finally right.
                 saturated = (
-                    hlt_setpoint >= target_temp + self.delta - 1e-9
+                    hlt_setpoint >= target_temp + active_band - 1e-9
                     and current_temp < target_temp - 0.5
                 )
                 if saturated and self._mash_is_climbing(current_temp):
@@ -807,6 +858,33 @@ class PID_HERMS(CBPiKettleLogic):
                 getTimeMs=pid_clock
             )
 
+            # The wider band used while the tun is known to hold only water.
+            # Blank means "same as DeltaTemp", so nothing changes for anyone who
+            # does not set it. Clamped to at least DeltaTemp: a *narrower* band
+            # for mash-in would be a configuration mistake, not an intention.
+            mashin = self.props.get("MashIn_DeltaTemp", None)
+            self.mashin_delta = self.delta
+            if mashin not in (None, ""):
+                try:
+                    self.mashin_delta = max(self.delta, float(mashin))
+                except (TypeError, ValueError):
+                    logging.warning(
+                        "PIDHerms: could not parse MashIn_DeltaTemp=%r, using "
+                        "DeltaTemp=%s", mashin, self.delta
+                    )
+            # True unless a step positively tells us otherwise, so every rest,
+            # ramp and mashout behaves exactly as before.
+            if not hasattr(self, "grain_present"):
+                self.grain_present = True
+            if not hasattr(self, "pump_hold"):
+                self.pump_hold = False
+            self._active_band = self.delta
+            if self.mashin_delta != self.delta:
+                logging.info(
+                    "PIDHerms: mash-in band %s %s, rest band %s %s",
+                    self.mashin_delta, self.TEMP_UNIT, self.delta, self.TEMP_UNIT
+                )
+
             # Inner loop: HLT error -> heater percent. These are the AutoTune-style gains.
             hp = self._float_prop("HLT_P", 117.0795)
             hi = self._float_prop("HLT_I", 0.2747)
@@ -931,9 +1009,26 @@ class PIDArduino(object):
         else:
             self._getTimeMs = getTimeMs
 
+    def set_output_max(self, value):
+        """Change the output ceiling on a running controller.
+
+        The outer HERMS loop's ceiling IS the HLT-over-mash band, and that band
+        should not be the same while the tun holds only water as it is once
+        grain is in. Both the clamp and the anti-windup test read _outputMax
+        fresh on every calc(), so moving it is safe - but the accumulated
+        integral must be brought down with it, or lowering the ceiling would
+        leave a term above the new rail that the anti-windup logic then refuses
+        to unwind.
+        """
+        value = float(value)
+        if value <= self._outputMin:
+            raise ValueError("outputMax must be greater than outputMin")
+        self._outputMax = value
+        self._iTerm = min(self._iTerm, value)
+        self._lastOutput = min(self._lastOutput, value)
+
     def calc(self, inputValue, setpoint):
         now = self._getTimeMs()
-
         # First call: seed the history from the reading in hand rather than from
         # zero, and answer immediately instead of waiting out a sample period.
         if self._lastCalc is None:
