@@ -41,7 +41,7 @@ import datetime
              Property.Select(label="Pump_Rest", options=["Yes", "No"],
                              description="Rest the pump periodically. No runs it continuously - the coil then never sits full of static wort."),
              Property.Kettle(label="HLT_Kettle",
-                             description="The HLT, so its setpoint shows what this cascade is commanding. Optional.")])
+                             description="Optional. The HLT, so its setpoint shows what this cascade is commanding. Found from HLT_Sensor when left blank.")])
 
 class PID_HERMS(CBPiKettleLogic):
 
@@ -139,9 +139,16 @@ class PID_HERMS(CBPiKettleLogic):
         which during a mash is stale and means nothing: a brewer looking at the
         HLT sees 168.8 while the cascade is actually asking for 157.
 
-        Named explicitly by HLT_Kettle when set. Otherwise found by matching the
-        HLT sensor, which is the same sensor the inner loop already reads, so a
-        rig that is wired sensibly needs no extra configuration.
+        Named explicitly by HLT_Kettle when set, otherwise found by matching the
+        HLT sensor - the same sensor the inner loop already reads, so a rig
+        wired sensibly needs nothing configured.
+
+        The field was briefly withdrawn because it rendered as an unlabelled
+        "Kettle" picker inside the Mash Tun's own settings, which reads like
+        nonsense. That was a UI bug rather than a naming one: PropsEdit.js
+        passed label= for text, number and select fields but not for kettle,
+        sensor, actor or fermenter, so all four fell back to their component's
+        default. It is why the HLT sensor field said only "Sensor" too.
         """
         kettle_id = self.props.get("HLT_Kettle", None)
         try:
