@@ -497,6 +497,40 @@ class PID_HERMS(CBPiKettleLogic):
         self._hlt_target_before = None
     
     # subroutine that controlls pump aue and ump stop if max pump temp is reached
+    async def _pump_wait(self, seconds, sensor_check=False):
+        """Wait, but stay responsive to a hold or a stop.
+
+        The pump's work interval was a loop that only ever tested the
+        temperature, and its rest was a single clock.sleep of the whole rest
+        time. Neither looked at pump_hold or at self.running, so a hold raised
+        one second into a 600 second interval left the pump recirculating for
+        the remaining 599.
+
+        That defeats the entire point of the hold. Mash-in raises it the moment
+        strike is reached so the grain goes into a still tun and so the ramp
+        does not overshoot - measured on this plant at +3.0 F with the pump
+        running against -0.1 F with it stopped. Ten minutes late is the same as
+        never.
+
+        Returns the reason it stopped waiting, so the caller can tell a
+        completed interval from an interruption.
+        """
+        deadline = clock.now() + max(0.0, float(seconds))
+        while clock.now() < deadline:
+            if not self.running:
+                return "stopped"
+            if getattr(self, "pump_hold", False):
+                return "hold"
+            if sensor_check:
+                try:
+                    reading = self.get_sensor_value(self.kettle.sensor).get("value")
+                    if reading is not None and reading >= self.max_pump_temp:
+                        return "max_temp"
+                except Exception:  # noqa: BLE001 - a missing reading is not fatal here
+                    pass
+            await clock.sleep(1)
+        return "elapsed"
+
     async def pump_control(self):
         #get pump based on agitator id
         self.pump = self.cbpi.actor.find_by_id(self.agitator)
@@ -529,18 +563,22 @@ class PID_HERMS(CBPiKettleLogic):
             # if the current temp is below the max pump temp, check if pause time is reached to pause pump
             if self.get_sensor_value(self.kettle.sensor).get("value") < self.max_pump_temp:
                 self._logger.debug("starting pump")
+                # Checked immediately before starting, not only at the top of
+                # the outer loop: a hold raised while the previous interval was
+                # running would otherwise start the pump one more time before
+                # anything noticed.
+                if getattr(self, "pump_hold", False) or not self.running:
+                    continue
                 #switch the pump on
                 await self.actor_on(self.agitator)
-                # calculate time, when pump should do the next pause
+                # Run the interval, but stay responsive to a hold or a stop.
                 # Brewing seconds, like every other duration here - the clock
                 # decides how fast those pass.
-                off_time = clock.now() + self.work_time
-                # run pump until next pause time is reached
-                while clock.now() < off_time:
-                    await clock.sleep(1)
-                    # stop cycle, if current temp is higher than max pump temp
-                    if self.get_sensor_value(self.kettle.sensor).get("value") >= self.max_pump_temp:
-                        break
+                reason = await self._pump_wait(self.work_time, sensor_check=True)
+                if reason in ("hold", "stopped"):
+                    # The hold branch at the top of the loop does the switching
+                    # off, so it sees a consistent state either way.
+                    continue
 
                 # Rests are optional. The pumps on plenty of rigs are rated for
                 # continuous duty, and the rest is not free: while it is resting
@@ -557,7 +595,10 @@ class PID_HERMS(CBPiKettleLogic):
                 # pause pump when active pump Interval is completed
                 self._logger.debug("resting pump")
                 await self.actor_off(self.agitator)
-                await clock.sleep(self.rest_time)
+                # Interruptible for the same reason as the interval above: this
+                # was a single sleep of the whole rest time, so a stop during a
+                # rest waited it out before anything else could happen.
+                await self._pump_wait(self.rest_time)
             # If temeprature is above max pump temp, and pump is on, switch it off
             # Staops also the pump if user switches it on and temp is abouve max pump temp
             else:
