@@ -940,6 +940,16 @@ class PID_HERMS(CBPiKettleLogic):
 
             pump_controller = asyncio.create_task(self.pump_control())
             temp_controller = asyncio.create_task(self.temp_control())
+            # Held on self so the finally can reach them.
+            #
+            # These were locals, and the only cancellation was after
+            # asyncio.wait() returned normally. Cancel run() itself while it is
+            # awaiting that call - which is what stopping a step does - and
+            # those lines never execute: CancelledError propagates straight
+            # past them to the handler below. Both children survive run()
+            # returning, and can then command the heater or the pump back on
+            # after the finally has switched them off.
+            self._children = (pump_controller, temp_controller)
 
             # Await both together. Awaiting the pump first meant a crash in
             # temp_control() was never surfaced while the pump kept running, so
@@ -963,11 +973,39 @@ class PID_HERMS(CBPiKettleLogic):
             logging.error("PIDHerms Error {}".format(e))
         finally:
             self.running = False
+
+            # Stop the children before commanding anything off.
+            #
+            # Setting running=False does not stop a task already inside an
+            # iteration or awaiting an actor command, so switching the heater
+            # off first leaves a window in which a surviving child turns it
+            # straight back on - after stop() has returned and the interface
+            # says the logic is gone.
+            for task in getattr(self, "_children", ()):
+                if task is not None and not task.done():
+                    task.cancel()
+            children = [t for t in getattr(self, "_children", ()) if t is not None]
+            if children:
+                await asyncio.gather(*children, return_exceptions=True)
+            self._children = ()
+
             # Hand the integral on before shutting down, so the next instance to
             # control this kettle - usually the very next step in the profile -
             # does not have to rebuild the steady-state offset from nothing.
             self._remember_integral()
-            await self.actor_off(self.heater)
+
+            # Each actuator independently: if one fails, the others are exactly
+            # the equipment still running.
+            for actor_id in (getattr(self, "heater", None),
+                             getattr(self, "agitator", None)):
+                if not actor_id:
+                    continue
+                try:
+                    await self.actor_off(actor_id)
+                except Exception as e:  # noqa: BLE001
+                    logging.error(
+                        "PIDHerms could not switch off %s: %s", actor_id, e
+                    )
 
 # Based on Arduino PID Library
 # See https://github.com/br3ttb/Arduino-PID-Library
