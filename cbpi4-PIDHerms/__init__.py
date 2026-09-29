@@ -793,33 +793,79 @@ class PID_HERMS(CBPiKettleLogic):
                 # HLT_Temp is known valid here - the blind case returned above.
                 heat_percent = self.hlt_pid.calc(self.HLT_Temp, hlt_setpoint)
 
-            # Drive the actor's on/off state, not just its power level.
+            # Drive the actor from what it IS doing, not from what this loop
+            # last told it to do.
             #
-            # ActorController.set_power() only forwards a number to the instance;
-            # it never changes state. For a plain GPIOActor that means a demand of
-            # 0% left the actor nominally on at 0% duty rather than genuinely off,
-            # and the element stayed latched to the control loop's last word.
-            # Switching off once demand has been zero for a few samples keeps it
-            # de-energized whenever no heat is wanted.
+            # heater_is_on and heat_percent_old were locals and the loop
+            # commanded only on a believed transition, so anything else
+            # touching the actor left it wrong for the rest of the brew: switch
+            # the element off from the dashboard and the loop went on believing
+            # it was driving it and never commanded again.
+            #
+            # ActorController.set_power() only forwards a number to the
+            # instance; it never changes state. For a plain GPIOActor that
+            # means a demand of 0% left the actor nominally on at 0% duty
+            # rather than genuinely off, which is why the off below exists at
+            # all. The dwell keeps it from chattering around zero demand.
+            actual_on, actual_power, known = self._heater_now()
+            if not known:
+                actual_on = heater_is_on
+                actual_power = heat_percent_old
+
             if heat_percent > 0:
                 zero_demand_samples = 0
-                if not heater_is_on:
+                if not actual_on:
                     await self.actor_on(self.heater, heat_percent)
-                    heater_is_on = True
-                    heat_percent_old = heat_percent
+                elif actual_power != heat_percent:
+                    await self.actor_set_power(self.heater, heat_percent)
+                heater_is_on = True
+                heat_percent_old = heat_percent
             else:
                 zero_demand_samples += 1
-                if heater_is_on and zero_demand_samples >= self.OFF_DWELL_SAMPLES:
+                if zero_demand_samples >= self.OFF_DWELL_SAMPLES:
+                    # Unconditional once the dwell has passed: this was guarded
+                    # on the local flag, so a swallowed failure flipped it and
+                    # the loop never retried.
                     await self.actor_off(self.heater)
                     heater_is_on = False
                     heat_percent_old = 0
-
-            # only push a new power value to the actor when it changes
-            if heater_is_on and heat_percent != heat_percent_old:
-                await self.actor_set_power(self.heater,heat_percent)
-                heat_percent_old = heat_percent
             await clock.sleep(self.sample_time)
 
+
+    def _heater_now(self):
+        """What the heater actor is actually doing: (on, power, known).
+
+        Read rather than remembered. See the call site in temp_control: belief
+        about hardware goes stale the moment anything else touches the actor,
+        and on a rig the brewer is something else that touches it.
+
+        The driver's state is preferred over the container's, because
+        find_by_id returns a container whose `instance` is the driver and
+        commands update the instance - reading the container can report off
+        while the element is on.
+
+        known=False means "no idea" and must not be read as off, because off
+        means command it on. Never raises.
+        """
+        try:
+            registry = getattr(self.cbpi, "actor", None)
+            if registry is None:
+                return False, None, False
+            actor = registry.find_by_id(self.heater)
+            if actor is None:
+                return False, None, True
+            instance = getattr(actor, "instance", None)
+            if instance is not None:
+                state = getattr(instance, "state", None)
+                power = getattr(instance, "power", getattr(actor, "power", None))
+            else:
+                state = getattr(actor, "state", None)
+                power = getattr(actor, "power", None)
+            if state is None:
+                return False, None, False
+            return bool(state), power, True
+        except Exception:  # noqa: BLE001
+            return False, None, False
 
     async def run(self):
         self._logger = logging.getLogger(type(self).__name__)
