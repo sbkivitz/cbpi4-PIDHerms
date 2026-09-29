@@ -170,7 +170,29 @@ class PID_HERMS(CBPiKettleLogic):
         kettle_id = self.props.get("HLT_Kettle", None)
         try:
             if kettle_id:
-                return self.cbpi.kettle.find_by_id(kettle_id)
+                # Never this kettle, however it was chosen.
+                #
+                # The sensor fallback below has always refused to select the
+                # controlled kettle; the explicit picker did not, and it offers
+                # every kettle including this one. Choosing the mash tun is an
+                # ordinary configuration mistake with an extraordinary
+                # consequence: _publish_hlt_setpoint writes the commanded HLT
+                # target onto the selected kettle, so the mash setpoint becomes
+                # the outer loop's own output and the next iteration reads it
+                # back as the rest temperature.
+                #
+                # Measured progression: 65 -> 68 -> 71 -> 74 -> 77 over four
+                # decisions, climbing for as long as it runs. A mash does not
+                # recover from that.
+                if kettle_id == self.id:
+                    self._logger.error(
+                        "PIDHerms: HLT_Kettle is this kettle. Ignoring it - "
+                        "the mash setpoint would become this loop's own "
+                        "output and climb without limit. Select the HLT, or "
+                        "leave it empty and set HLT_Sensor."
+                    )
+                else:
+                    return self.cbpi.kettle.find_by_id(kettle_id)
             sensor_id = self.props.get("HLT_Sensor", None)
             if not sensor_id:
                 return None
@@ -192,6 +214,14 @@ class PID_HERMS(CBPiKettleLogic):
         the number they actually set. on_stop puts the original back.
         """
         if getattr(self, "_hlt_kettle", None) is None:
+            return
+        # Never write this kettle's own setpoint.
+        #
+        # _hlt_kettle() refuses to resolve to the controlled kettle, so this
+        # should be unreachable - and it is guarded anyway because the failure
+        # is a mash setpoint that climbs without limit, driven by this loop's
+        # own output. That is worth two lines.
+        if getattr(self._hlt_kettle, "id", None) == self.id:
             return
         rounded = round(float(value), 1)
         if self._hlt_kettle.target_temp == rounded:
