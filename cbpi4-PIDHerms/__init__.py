@@ -127,6 +127,32 @@ class PID_HERMS(CBPiKettleLogic):
     #: logic that has not completed a cycle yet is not assumed broken.
     heat_available = True
 
+    def _clamp_hlt_setpoint(self, hlt_setpoint, target_temp):
+        """Cap the HLT demand at the mash target when nothing is flowing.
+
+        pump_control() and temp_control() are independent tasks that never talk
+        to each other, so during the pump's rest the outer loop carried on
+        asking for mash_target + DeltaTemp. The wort trapped in the coil has no
+        flow and a lot of surface area against hot liquor, so it heads for HLT
+        temperature - and a slug of overheated wort is pushed into the mash when
+        the pump restarts. On a sixty minute rest with the default one-minute
+        rest in every ten, that happens five times.
+
+        Clamping to the mash target while nothing is moving means the trapped
+        wort tends towards exactly the temperature it is supposed to be. It
+        costs a little ramp rate, which is the right trade: there is no benefit
+        to superheating static wort, and a brewer who wants a faster ramp should
+        shorten the rest rather than cook the coil.
+
+        This is a method rather than two inline lines so that it can be called
+        directly. The test for it used to recompute `min(setpoint, target)` in
+        its own body and assert on that arithmetic, which passes whatever
+        production does - including deleting the clamp entirely.
+        """
+        if not self._pump_is_running():
+            return min(hlt_setpoint, target_temp)
+        return hlt_setpoint
+
     def _pump_is_running(self):
         """Is wort actually moving through the coil right now?
 
@@ -762,27 +788,10 @@ class PID_HERMS(CBPiKettleLogic):
                 # integral cannot wind up against the cap. Full mash demand targets
                 # mash_target + DeltaTemp; as the mash nears its target the offset eases
                 # back toward mash_target, so at rest the HLT sits close to the mash.
-                hlt_setpoint = target_temp + self.pid.calc(current_temp, target_temp)
-
-                # No flow means no reason to be hotter than the mash wants.
-                #
-                # pump_control() and temp_control() are independent tasks that
-                # never talk to each other, so during the pump's rest the outer
-                # loop carried on asking for mash_target + DeltaTemp. The wort
-                # trapped in the coil has no flow and a lot of surface area
-                # against hot liquor, so it heads for HLT temperature - and a
-                # slug of overheated wort is pushed into the mash when the pump
-                # restarts. On a sixty minute rest with the default one-minute
-                # rest in every ten, that happens five times.
-                #
-                # Clamping to the mash target while nothing is moving means the
-                # trapped wort tends towards exactly the temperature it is
-                # supposed to be. It costs a little ramp rate, which is the
-                # right trade: there is no benefit to superheating static wort,
-                # and a brewer who wants a faster ramp should shorten the rest
-                # rather than cook the coil.
-                if not self._pump_is_running():
-                    hlt_setpoint = min(hlt_setpoint, target_temp)
+                hlt_setpoint = self._clamp_hlt_setpoint(
+                    target_temp + self.pid.calc(current_temp, target_temp),
+                    target_temp,
+                )
 
                 # Show it. While the cascade is running the HLT is not being
                 # held at its own configured target, it is being driven to this
