@@ -879,6 +879,24 @@ class PID_HERMS(CBPiKettleLogic):
                     await self.actor_off(self.heater)
                     heater_is_on = False
                     heat_percent_old = 0
+
+            # Record what the cascade asked for, when the brewer wants it.
+            #
+            # Both loops, because this is a cascade and either can be the one
+            # that is mistuned: the outer PID turns mash error into an HLT
+            # setpoint, the inner one turns HLT error into element duty. A duty
+            # curve without the setpoint it was chasing says very little.
+            if self.pid_logging_enabled():
+                self.log_data("duty", round(float(heat_percent), 2))
+                self.log_data("mash_setpoint", round(float(target_temp), 2))
+                try:
+                    self.log_data("hlt_setpoint", round(float(hlt_setpoint), 2))
+                except (TypeError, ValueError, NameError):
+                    # hlt_setpoint is only bound on the cascade path; the boil
+                    # and fault paths skip it. Missing one series must not cost
+                    # the other two.
+                    pass
+
             await clock.sleep(self.sample_time)
 
 
