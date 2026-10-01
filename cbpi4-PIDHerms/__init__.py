@@ -67,6 +67,11 @@ class PID_HERMS(CBPiKettleLogic):
     # the stale timer forever.
     SENSOR_REPEAT_EPSILON_C = 0.07
     SENSOR_REPEAT_EPSILON_F = 0.12
+    # How far below target a reading must sit before a frozen value counts as
+    # evidence of a fault rather than evidence of good control. Roughly the
+    # band a competent PID holds, so anything inside it is a hold, not a stall.
+    SENSOR_SETTLED_BAND_C = 0.5
+    SENSOR_SETTLED_BAND_F = 0.9
     # Consecutive zero-demand samples before the heater actor is switched off
     # rather than merely held at 0%. Purely to stop a PID sitting at zero from
     # chattering a contactor - at 0% duty no heat is produced either way.
@@ -414,13 +419,44 @@ class PID_HERMS(CBPiKettleLogic):
             return default
         return parsed
 
-    def _read_trusted_temp(self, sensor_id, label):
+    def _should_be_changing(self, value, target):
+        """Is this reading expected to be moving right now?
+
+        True when it sits far enough below target that heat should be driving it
+        up, so a frozen value is genuinely anomalous. False once it reaches the
+        target band, where a steady reading is what good control looks like.
+
+        Also False above target: a mash tun has no cooling, so a flat reading
+        there is equally expected.
+
+        An unknown target means there is nothing to reason from, so the caller
+        keeps the stricter behaviour and the watch still applies.
+        """
+        if target is None:
+            return True
+        try:
+            target = float(target)
+        except (TypeError, ValueError):
+            return True
+        if not math.isfinite(target):
+            return True
+        band = (
+            self.SENSOR_SETTLED_BAND_C
+            if getattr(self, "TEMP_UNIT", "C") == "C"
+            else self.SENSOR_SETTLED_BAND_F
+        )
+        return (target - value) > band
+
+    def _read_trusted_temp(self, sensor_id, label, target=None):
         """Return (temperature, reason) where reason explains why it is unsafe.
 
         A numeric value alone is not enough: some sensor drivers keep publishing
         their last value after a failed read. Core exposes `age` for drivers that
         can say when they last changed, and the repeated-value watch here covers
         drivers that keep resetting that age around a frozen number.
+
+        `target` is what this sensor is being driven towards, and it decides
+        whether a motionless reading is suspicious - see _should_be_changing.
         """
         if not sensor_id:
             return None, "{} sensor is not configured".format(label)
@@ -467,15 +503,22 @@ class PID_HERMS(CBPiKettleLogic):
             if stale_seconds <= 0:
                 stale_seconds = self.DEFAULT_SENSOR_STALE_SECONDS
 
-            timestamp = state.get("timestamp")
-            try:
-                now = float(timestamp)
-            except (TypeError, ValueError):
-                # SensorController timestamps and ages in wall-clock seconds.
-                # Use the same clock for this freshness watch on hardware; tests
-                # and simulators that want accelerated time can provide their own
-                # timestamp in the sensor state they feed to this consumer.
-                now = time.time()
+            # Brewing time, not wall-clock, and deliberately different from the
+            # age check above.
+            #
+            # Those two ask different questions. Age asks "did the driver update
+            # recently", which is a property of real hardware and belongs on the
+            # real clock. This asks "has the temperature failed to move over a
+            # span of brewing that matters", which is a property of the process
+            # and belongs on the same clock the rest of this loop runs on.
+            #
+            # Using time.time() here made this the only check in the plugin that
+            # ignores the simulator. At 60x, 300 wall-clock seconds is five hours
+            # of brewing, so no simulated run could ever reach the limit and no
+            # simulated run could ever test it - which is exactly how a false
+            # trip reached a live rig. clock.scale() is 1.0 on hardware, so this
+            # is bit-identical there.
+            now = clock.now()
             key = sensor_id
             watched = self._sensor_watch.get(key)
             epsilon = (
@@ -489,6 +532,48 @@ class PID_HERMS(CBPiKettleLogic):
                 or not math.isfinite(watched_value)
                 or abs(watched_value - value) > epsilon
             ):
+                self._sensor_watch[key] = {"value": value, "changed_at": now}
+                return value, None
+
+            # A reading that does not move is only evidence of a fault when the
+            # temperature ought to be moving. Hold a mash on setpoint and a good
+            # controller produces precisely this: one quantised value, unchanged,
+            # for the length of the rest. Tripping on that turns the heater off
+            # *because* the PID is doing its job - and with a DS18B20's 0.0625 C
+            # step, and an epsilon that deliberately treats adjacent counts as
+            # unchanged, it is the normal case rather than an edge case.
+            #
+            # Observed: a mash held at 152.60 F tripped the watch after 301s and
+            # the heater was switched off mid-rest. Left alone it sawtooths for
+            # the whole rest - off, sag, "readings restored", on, settle, off -
+            # across the phase where stable temperature decides fermentability.
+            #
+            # So the window only accrues while the reading sits far enough below
+            # target to be expected to climb.
+            #
+            # This narrowing has a real cost, stated plainly because an earlier
+            # version of this comment got it wrong: a probe frozen *at* setpoint
+            # is no longer detected here, and nothing else detects it either.
+            #
+            # The age check above does not cover it. Age measures republishing,
+            # not measurement: a driver that keeps publishing a stale value
+            # keeps last_update fresh, so its age never grows. And the tolerance
+            # is not 30s - SensorController.expected_max_age() returns
+            # max(30, Interval * 3), which is 180s for a OneWire probe at its
+            # default Interval of 60. Age catches a driver that stops; it cannot
+            # catch one that lies.
+            #
+            # Do not read a bound into this. The outer loop clamps the
+            # *requested* HLT setpoint to target + DeltaTemp; it does not bound
+            # the HLT's actual temperature. Given healthy HLT measurement and
+            # actuation, a frozen-at-setpoint mash probe drifts the mash towards
+            # target + DeltaTemp, which is enough to wreck a rest profile.
+            # Thermal overshoot, a hot starting state, or a fault in the HLT's
+            # own probe or actuator all void that, and nothing in this function
+            # would notice - it sees one sensor at a time.
+            # See DEFECTS.md M4 - detecting it needs independent evidence, which
+            # this function does not have.
+            if not self._should_be_changing(value, target):
                 self._sensor_watch[key] = {"value": value, "changed_at": now}
                 return value, None
 
@@ -654,18 +739,29 @@ class PID_HERMS(CBPiKettleLogic):
         band_warning_sent = False
 
         while self.running:
-            self.HLT_Temp, hlt_fault = self._read_trusted_temp(self.sensor, "HLT")
-
-            # current mash temperature and its target
-            current_temp, mash_fault = self._read_trusted_temp(
-                self.kettle.sensor, "Mash"
-            )
+            # Parsed before the sensor reads because the repeated-value watch
+            # needs to know whether each reading is expected to be climbing.
             try:
                 target_temp = float(self.get_kettle_target_temp(self.id))
                 if not math.isfinite(target_temp):
                     target_temp = None
             except (TypeError, ValueError):
                 target_temp = None
+
+            # What the outer loop last commanded the HLT to reach. The HLT holds
+            # on its own setpoint for most of a rest, so it has exactly the same
+            # claim to a settled reading as the mash does.
+            hlt_target = getattr(
+                getattr(self, "_hlt_kettle", None), "target_temp", None
+            )
+            self.HLT_Temp, hlt_fault = self._read_trusted_temp(
+                self.sensor, "HLT", hlt_target
+            )
+
+            # current mash temperature and its target
+            current_temp, mash_fault = self._read_trusted_temp(
+                self.kettle.sensor, "Mash", target_temp
+            )
 
             # Tell anything watching whether heat can actually reach the mash.
             #
