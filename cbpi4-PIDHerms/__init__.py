@@ -419,6 +419,13 @@ class PID_HERMS(CBPiKettleLogic):
             return default
         return parsed
 
+    @staticmethod
+    def _stale_message(label, value, unchanged_for, stale_seconds):
+        return (
+            "{} sensor has been unchanged at {:.2f} for {:.0f}s "
+            "(limit {:.0f}s)"
+        ).format(label, value, unchanged_for, stale_seconds)
+
     def _should_be_changing(self, value, target):
         """Is this reading expected to be moving right now?
 
@@ -551,6 +558,42 @@ class PID_HERMS(CBPiKettleLogic):
             # So the window only accrues while the reading sits far enough below
             # target to be expected to climb.
             #
+            # Once raised, a repeated-value fault is cleared ONLY by the
+            # measurement moving - which is the branch above, and the only
+            # branch that replaces this entry.
+            #
+            # Nothing else counts as recovery, and a change of target least of
+            # all. The fault handler publishes the HLT target down to the mash
+            # target when it cuts heat; without this latch the next iteration
+            # judged the still-frozen reading against that LOWERED target,
+            # found it at or above, reset the window, announced "Temperature
+            # readings restored" and resumed heating. Measured against the real
+            # cascade with a frozen HLT: OFF at 305s, ON at 310s, OFF at 615s,
+            # ON at 620s, with neither reading ever changing - the same
+            # sawtooth this watch was rewritten to stop, re-entered by a
+            # different door, and an interface asserting a recovery that had
+            # not happened.
+            if watched.get("faulted"):
+                return None, self._stale_message(
+                    label, value, now - watched["changed_at"], stale_seconds
+                )
+
+            # A reading that does not move is only evidence of a fault when the
+            # temperature ought to be moving. Hold a mash on setpoint and a good
+            # controller produces precisely this: one quantised value, unchanged,
+            # for the length of the rest. Tripping on that turns the heater off
+            # *because* the PID is doing its job - and with a DS18B20's 0.0625 C
+            # step, and an epsilon that deliberately treats adjacent counts as
+            # unchanged, it is the normal case rather than an edge case.
+            #
+            # Observed: a mash held at 152.60 F tripped the watch after 301s and
+            # the heater was switched off mid-rest. Left alone it sawtooths for
+            # the whole rest - off, sag, "readings restored", on, settle, off -
+            # across the phase where stable temperature decides fermentability.
+            #
+            # So the window only accrues while the reading sits far enough below
+            # target to be expected to climb.
+            #
             # This narrowing has a real cost, stated plainly because an earlier
             # version of this comment got it wrong: a probe frozen *at* setpoint
             # is no longer detected here, and nothing else detects it either.
@@ -579,10 +622,12 @@ class PID_HERMS(CBPiKettleLogic):
 
             unchanged_for = now - watched["changed_at"]
             if unchanged_for > stale_seconds:
-                return None, (
-                    "{} sensor has been unchanged at {:.2f} for {:.0f}s "
-                    "(limit {:.0f}s)"
-                ).format(label, value, unchanged_for, stale_seconds)
+                # Latched on the stored entry, not a replacement, so it
+                # survives until the measurement moves.
+                watched["faulted"] = True
+                return None, self._stale_message(
+                    label, value, unchanged_for, stale_seconds
+                )
         except Exception as e:  # noqa: BLE001
             getattr(self, "_logger", logging.getLogger(type(self).__name__)).error(
                 "PIDHerms: cannot validate %s sensor freshness: %s", label, e
