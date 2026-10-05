@@ -1079,6 +1079,37 @@ class PID_HERMS(CBPiKettleLogic):
     async def run(self):
         self._logger = logging.getLogger(type(self).__name__)
         try:
+            # Identify the actuators and establish the heater off BEFORE
+            # anything that can fail.
+            #
+            # This used to sit about a hundred lines down, after every setting
+            # had been parsed. Those parses can raise - int("abc") on a
+            # SampleTime, float("") on a rest interval, a kettle that cannot be
+            # resolved - and when they did, run() went straight to its finally,
+            # which looks for the heater with getattr(self, "heater", None),
+            # found it had never been assigned, and skipped. Not a crash: a
+            # silent skip.
+            #
+            # On a rig driven by hand that is the dangerous case. The brewer
+            # switches an element on manually, then starts the kettle logic; a
+            # malformed setting aborts the startup; the element keeps running
+            # at whatever it was, with no control loop, no sensor being read
+            # and no limits - while the interface shows the logic as stopped.
+            # Measured: actor_off was never called once and a 70% element
+            # stayed at 70%.
+            #
+            # Resolving the actuator is the one thing that must happen before
+            # anything is allowed to go wrong, because it is what makes the
+            # cleanup able to act at all.
+            self.kettle = self.get_kettle(self.id)
+            self.heater = self.kettle.heater
+            self.agitator = self.kettle.agitator
+            if self.heater:
+                # temp_control() also starts from a known de-energized state.
+                # This is the same guarantee, moved to where it still holds
+                # when the startup does not finish.
+                await self.actor_off(self.heater)
+
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
             # A HERMS only moves heat while the HLT is hotter than the wort. A zero or
             # negative band leaves the outer loop no authority at all, so the mash would
@@ -1202,9 +1233,7 @@ class PID_HERMS(CBPiKettleLogic):
             self.max_pid_temp = self._temperature_prop("Max_PID_Temp", 88)
             self.max_pump_temp = self._temperature_prop("Max_Pump_Temp", 88)
 
-            self.kettle = self.get_kettle(self.id)
-            self.heater = self.kettle.heater
-            self.agitator = self.kettle.agitator
+            # Resolved at the top of run(), before anything fallible.
             self.sensor = self.props.get("HLT_Sensor", None)
 
             # Remember the HLT's own setpoint before the cascade starts
