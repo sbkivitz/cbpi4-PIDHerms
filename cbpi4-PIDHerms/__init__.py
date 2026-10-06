@@ -362,14 +362,40 @@ class PID_HERMS(CBPiKettleLogic):
             return celsius
         return celsius * 9.0 / 5.0 + 32.0
 
-    def _temperature_prop(self, name, celsius_default):
-        """Read a temperature property whose historical metadata default was Celsius.
+    # Below this, an absolute temperature threshold cannot be a Fahrenheit
+    # value a brewer meant. A mash runs near 150 F, so any of these thresholds
+    # set lower would stop the pump or bypass the PID during a normal rest.
+    # 88 and 98 - the historical Celsius defaults - both land here, and so does
+    # a typo like 95.
+    IMPLAUSIBLE_F_THRESHOLD = 120.0
 
-        CraftBeerPi stores plugin defaults in props, so a Fahrenheit install can
-        arrive here with Max_Boil_Temp='98' even though 98 was meant as Celsius.
-        Treat the exact historical Celsius default as unset on non-Celsius
-        systems; any other configured value is the brewer's value in their
-        configured unit.
+    def _temperature_prop(self, name, celsius_default):
+        """Read an absolute temperature threshold, guarding against Celsius.
+
+        CraftBeerPi seeds its dialogs from plugin metadata, so a brewer who
+        opens the kettle properties on a Fahrenheit rig and saves without
+        editing persists Max_Pump_Temp='88' - which was authored as Celsius.
+
+        This originally resolved that by treating a value EQUAL to the
+        historical Celsius default as unset. An independent review called that
+        out, correctly: it cannot tell a stale default from a deliberate entry.
+        The first attempt at a fix went the other way and made every configured
+        value literal - and that is worse, because the two errors are not
+        symmetric:
+
+          - reading a deliberate 3 as 5.4 widens a band. Wrong, harmless.
+          - reading a persisted 88 as 88 F stops the pump for the whole mash,
+            on a HERMS, while the element drives the HLT. Dangerous.
+
+        So absolutes are guarded by PLAUSIBILITY rather than by equality. A
+        threshold below IMPLAUSIBLE_F_THRESHOLD cannot be a Fahrenheit value
+        anyone intended, whether it came from the old default or a typo - which
+        makes this strictly broader than the equality test it replaces, since
+        95 was taken literally before.
+
+        Either way the brewer is now TOLD, by notification rather than a log
+        line nobody reads. Being overridden silently was the part nobody
+        defended.
         """
         default = self._temp_default(celsius_default)
         value = self.props.get(name, None)
@@ -383,20 +409,98 @@ class PID_HERMS(CBPiKettleLogic):
                 name, value, default, getattr(self, "TEMP_UNIT", ""),
             )
             return default
-        if getattr(self, "TEMP_UNIT", "C") != "C" and abs(parsed - float(celsius_default)) < 1e-9:
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
             self._logger.warning(
-                "PIDHerms: %s=%s is the old Celsius default on a %s system; "
-                "using %.1f %s instead",
-                name, value, self.TEMP_UNIT, default, self.TEMP_UNIT,
+                "PIDHerms: %s=%r is not a usable number, using %.1f %s",
+                name, value, default, getattr(self, "TEMP_UNIT", ""),
             )
             return default
+
+        unit = getattr(self, "TEMP_UNIT", "C")
+        if unit != "C" and parsed < self.IMPLAUSIBLE_F_THRESHOLD:
+            converted = parsed * 9.0 / 5.0 + 32.0
+            self._tell_config(
+                "{} is set to {:g}, which is below any usable mash "
+                "temperature in {}. Reading it as {:g} C and using {:.1f} {}. "
+                "If you really meant {:g} {}, the pump or the PID would cut "
+                "out during a normal rest.".format(
+                    name, parsed, unit, parsed, converted, unit, parsed, unit
+                )
+            )
+            return converted
         return parsed
 
-    def _delta_prop(self):
-        """Read DeltaTemp, converting the historical Celsius default on F rigs.
+    def _tell_config(self, message):
+        """Say something about configuration, once, where the brewer will see it."""
+        self._logger.warning("PIDHerms: %s", message)
+        try:
+            self.cbpi.notify(
+                "{} configuration".format(getattr(self.kettle, "name", "Mash")),
+                message,
+                NotificationType.WARNING,
+            )
+        except Exception:  # noqa: BLE001 - never let a notice break a start
+            pass
 
-        DeltaTemp is a temperature difference, so the conversion is a scale
-        factor only: 3 C of HERMS band is 5.4 F, not 37.4 F.
+    def _check_threshold_order(self):
+        """Warn when the pump stops at or below the open-loop heating point.
+
+        Above Max_PID_Temp the cascade is bypassed and the element is driven
+        open-loop at Max_Output. Above Max_Pump_Temp the pump stops. If the
+        pump threshold is the lower of the two, crossing it produces **full
+        power with no circulation**: on a HERMS the coil has no flow, so the
+        heat does not reach the mash, the mash does not climb to the next
+        threshold, and the element stays at Max_Output.
+
+        Found by an independent review of a setup table that recommended
+        Max_PID_Temp and Max_Pump_Temp at the SAME value, which lands exactly
+        on this. Documenting it was not enough - the ordering is checkable, so
+        it is checked.
+
+        A warning rather than a refusal. Both thresholds normally sit far above
+        any mash temperature, so this is a latent misconfiguration rather than
+        a live fault, and refusing to start a logic that would otherwise mash
+        correctly is its own kind of ruined day.
+        """
+        try:
+            pid_t = float(self.max_pid_temp)
+            pump_t = float(self.max_pump_temp)
+        except (TypeError, ValueError):
+            return
+        if pump_t > pid_t:
+            return
+        unit = getattr(self, "TEMP_UNIT", "")
+        message = (
+            "Max_Pump_Temp ({:g}) is not above Max_PID_Temp ({:g}). Above "
+            "{:g} {} the element is driven open-loop at full output, and at "
+            "or above {:g} the pump stops - so that range is full power with "
+            "no circulation. Raise Max_Pump_Temp above Max_PID_Temp."
+            .format(pump_t, pid_t, pid_t, unit, pump_t)
+        )
+        self._logger.warning("PIDHerms: %s", message)
+        try:
+            self.cbpi.notify(
+                "{} configuration".format(getattr(self.kettle, "name", "Mash")),
+                message,
+                NotificationType.WARNING,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _delta_prop(self):
+        """Read DeltaTemp, taking the configured value literally.
+
+        This is the case that made the old equality heuristic indefensible.
+        DeltaTemp is the HLT overshoot band, and **3 F is a perfectly sensible
+        band** - tighter mash tracking, gentler on the enzymes in the coil. A
+        brewer who typed 3 on a Fahrenheit rig silently got 5.4, nearly double
+        what they asked for, with no way to express 3 short of typing
+        3.000001.
+
+        The conversion is still the right DEFAULT, because an untouched field
+        really does hold the authored Celsius 3. So: blank takes the unit-aware
+        default, anything configured is used as written, and an ambiguous value
+        tells the brewer rather than overriding them.
         """
         default = 3.0 if getattr(self, "TEMP_UNIT", "C") == "C" else 5.4
         value = self.props.get("DeltaTemp", None)
@@ -410,13 +514,27 @@ class PID_HERMS(CBPiKettleLogic):
                 value, default, getattr(self, "TEMP_UNIT", ""),
             )
             return default
-        if getattr(self, "TEMP_UNIT", "C") != "C" and abs(parsed - 3.0) < 1e-9:
+        if parsed != parsed or parsed in (float("inf"), float("-inf")):
             self._logger.warning(
-                "PIDHerms: DeltaTemp=3 is the old Celsius default on a %s system; "
-                "using %.1f %s instead",
-                self.TEMP_UNIT, default, self.TEMP_UNIT,
+                "PIDHerms: DeltaTemp=%r is not a usable number, using %.1f %s",
+                value, default, getattr(self, "TEMP_UNIT", ""),
             )
             return default
+        if (getattr(self, "TEMP_UNIT", "C") != "C"
+                and abs(parsed - 3.0) < 1e-9):
+            # Reported, not overridden. Unlike the absolute thresholds, both
+            # readings of this one are safe - a 3 degree band tracks tighter
+            # and ramps slower, a 5.4 degree band the reverse - so the brewer's
+            # number is honoured and the ambiguity is handed to them.
+            self._tell_config(
+                "DeltaTemp is set to {:g}, which is also the old Celsius "
+                "default. It is being used as {:g} {} exactly as configured; "
+                "a {:g} degree HLT band is a reasonable thing to want. If you "
+                "meant the Celsius default, enter {:.1f}.".format(
+                    parsed, parsed, getattr(self, "TEMP_UNIT", ""),
+                    parsed, default,
+                )
+            )
         return parsed
 
     @staticmethod
@@ -1232,6 +1350,7 @@ class PID_HERMS(CBPiKettleLogic):
             self.max_boil_temp = self._temperature_prop("Max_Boil_Temp", 98)
             self.max_pid_temp = self._temperature_prop("Max_PID_Temp", 88)
             self.max_pump_temp = self._temperature_prop("Max_Pump_Temp", 88)
+            self._check_threshold_order()
 
             # Resolved at the top of run(), before anything fallible.
             self.sensor = self.props.get("HLT_Sensor", None)
