@@ -665,7 +665,9 @@ class PID_HERMS(CBPiKettleLogic):
                 or not math.isfinite(watched_value)
                 or abs(watched_value - value) > epsilon
             ):
-                self._sensor_watch[key] = {"value": value, "changed_at": now}
+                self._sensor_watch[key] = {
+                    "value": value, "changed_at": now, "seen_at": now
+                }
                 return value, None
 
             # A reading that does not move is only evidence of a fault when the
@@ -761,13 +763,26 @@ class PID_HERMS(CBPiKettleLogic):
                 # freeze: anything moving slower than 1.44 F/hour looks
                 # identical to a dead probe. Rather than chase a smarter
                 # threshold, stand the watch down when the physics says the
-                # reading has no reason to move. Detection re-arms the moment
-                # the pump restarts.
-                self._sensor_watch[key] = {"value": value, "changed_at": now}
+                # reading has no reason to move.
+                #
+                # The window is PAUSED, not reset. Resetting looks equivalent
+                # and quietly deletes the watch on some configurations: with
+                # Pump_Rest enabled and a Rest_Interval shorter than the window,
+                # no continuous pumping stretch is ever long enough to complete
+                # one, so a genuinely dead probe would never be caught on a rig
+                # that rests its pump often. Carrying changed_at forward by the
+                # elapsed interval makes the window count pumping seconds only -
+                # it freezes through a rest or a dough-in and resumes where it
+                # left off, so the watch survives any rest schedule.
+                watched["changed_at"] += now - watched.get("seen_at", now)
+                watched["seen_at"] = now
                 return value, None
 
+            watched["seen_at"] = now
             if not self._should_be_changing(value, target):
-                self._sensor_watch[key] = {"value": value, "changed_at": now}
+                self._sensor_watch[key] = {
+                    "value": value, "changed_at": now, "seen_at": now
+                }
                 return value, None
 
             unchanged_for = now - watched["changed_at"]
