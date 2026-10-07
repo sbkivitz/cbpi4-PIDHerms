@@ -572,7 +572,7 @@ class PID_HERMS(CBPiKettleLogic):
         )
         return (target - value) > band
 
-    def _read_trusted_temp(self, sensor_id, label, target=None):
+    def _read_trusted_temp(self, sensor_id, label, target=None, heat_path_open=True):
         """Return (temperature, reason) where reason explains why it is unsafe.
 
         A numeric value alone is not enough: some sensor drivers keep publishing
@@ -582,6 +582,14 @@ class PID_HERMS(CBPiKettleLogic):
 
         `target` is what this sensor is being driven towards, and it decides
         whether a motionless reading is suspicious - see _should_be_changing.
+
+        `heat_path_open` says whether heat can physically reach this vessel right
+        now. The mash tun has no element: the coil is its only heat path, and it
+        carries nothing while the pump is stopped. A flat mash reading with the
+        pump off is the expected physics, not a broken probe, so the caller
+        passes the pump state and the watch stands down. The HLT has its own
+        element and passes True - a frozen HLT probe while the element is live is
+        exactly the case worth catching, and this must not weaken it.
         """
         if not sensor_id:
             return None, "{} sensor is not configured".format(label)
@@ -734,6 +742,30 @@ class PID_HERMS(CBPiKettleLogic):
             # would notice - it sees one sensor at a time.
             # See DEFECTS.md M4 - detecting it needs independent evidence, which
             # this function does not have.
+            if not heat_path_open:
+                # Measured on the e2e rig, and it is the dough-in window that
+                # makes this reachable rather than some exotic fault.
+                #
+                # MashInStep stops the pump the moment strike temperature is
+                # reached - deliberately, so grain goes into a still tun - and
+                # then waits for a human. With the coil carrying nothing the
+                # mash drifts, slowly, towards room temperature: 112.04 ->
+                # 111.20 F over eight minutes in the recorded run. That is
+                # under the 0.12 F epsilon per 300 s window, so the watch read
+                # a vessel it had itself been told to isolate as a frozen probe
+                # and logged "Mash sensor has been unchanged at 112.04 for
+                # 301s - heater turned off" eight times while the brewer was
+                # doughing in.
+                #
+                # The epsilon is what makes a drift indistinguishable from a
+                # freeze: anything moving slower than 1.44 F/hour looks
+                # identical to a dead probe. Rather than chase a smarter
+                # threshold, stand the watch down when the physics says the
+                # reading has no reason to move. Detection re-arms the moment
+                # the pump restarts.
+                self._sensor_watch[key] = {"value": value, "changed_at": now}
+                return value, None
+
             if not self._should_be_changing(value, target):
                 self._sensor_watch[key] = {"value": value, "changed_at": now}
                 return value, None
@@ -917,13 +949,27 @@ class PID_HERMS(CBPiKettleLogic):
             hlt_target = getattr(
                 getattr(self, "_hlt_kettle", None), "target_temp", None
             )
+            # The HLT has its own element, so the pump has no bearing on whether
+            # its reading should move: it keeps the strict watch.
             self.HLT_Temp, hlt_fault = self._read_trusted_temp(
                 self.sensor, "HLT", hlt_target
             )
 
             # current mash temperature and its target
+            #
+            # Read once here rather than relying on the heat_available computed
+            # below, which needs current_temp and so cannot exist yet. The pump
+            # alone is the right question anyway: heat_available also folds in
+            # the HLT gradient, and a mash sitting at the same temperature as
+            # the HLT with the pump running genuinely should be flat for a
+            # reason the settled band already covers.
+            mash_pumping = True
+            try:
+                mash_pumping = self._pump_is_running()
+            except Exception:  # noqa: BLE001 - never fail a read over this
+                mash_pumping = True
             current_temp, mash_fault = self._read_trusted_temp(
-                self.kettle.sensor, "Mash", target_temp
+                self.kettle.sensor, "Mash", target_temp, heat_path_open=mash_pumping
             )
 
             # Tell anything watching whether heat can actually reach the mash.
@@ -951,7 +997,10 @@ class PID_HERMS(CBPiKettleLogic):
                 # time the mash should have been rising, which is the same
                 # mistake in miniature as the one that made it warn during a
                 # step change.
-                pumping = self._pump_is_running()
+                # Reuses the reading taken for the sensor watch above rather
+                # than asking again, so the two cannot disagree about the pump
+                # within a single sample.
+                pumping = mash_pumping
                 self.heat_available = (
                     pumping
                     and self.HLT_Temp is not None
