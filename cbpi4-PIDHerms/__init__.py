@@ -28,7 +28,7 @@ import datetime
              Property.Select(label="SampleTime", options=[2,5], 
                              description="PID Sample time in seconds. Default: 5 (How often is the output calculation done)"),
              Property.Number(label="Max_Pump_Temp", configurable=True, default_value=88,
-                             description="Max temp the pump can work in. Interpreted in the configured temperature unit; the default is 88 C / 190.4 F."),
+                             description="Max temp the pump can work in. The pump stops when the mash reaches this, with a notification. Interpreted in the configured temperature unit; the default is 88 C / 190.4 F."),
              Property.Number(label = "Max_Output", configurable = True, default_value = 100, 
                              description="Max power for PID and Ramp up."),
              Property.Number(label="Max_Boil_Output", configurable=True, default_value=85,
@@ -36,7 +36,7 @@ import datetime
              Property.Number(label="Max_Boil_Temp", configurable=True, default_value=98,
                              description="When Temperature reaches this, power will be reduced to Max Boil Output. Interpreted in the configured temperature unit; the default is 98 C / 208.4 F."),
              Property.Number(label="Max_PID_Temp", configurable=True,
-                             description="When this temperature is reached, PID will be turned off"),
+                             description="When the mash reaches this, the PID stops regulating and the element runs at a fixed Max_Output, with a notification. Interpreted in the configured temperature unit; the default is 88 C / 190.4 F."),
              Property.Number(label="Sensor_Stale_Seconds", configurable=True, default_value=300,
                              description="Seconds a mash or HLT sensor may repeat the exact same numeric value before heating is suspended. Default: 300 seconds."),
              Property.Number(label="Rest_Interval", configurable=True, default_value=600,
@@ -442,50 +442,97 @@ class PID_HERMS(CBPiKettleLogic):
         except Exception:  # noqa: BLE001 - never let a notice break a start
             pass
 
-    def _check_threshold_order(self):
-        """Warn when the pump stops at or below the open-loop heating point.
+    # How far below a limit the mash must fall before reaching it again is
+    # announced again, so a reading hovering on the line announces once.
+    LIMIT_REARM_MARGIN = 1.0
 
-        Above Max_PID_Temp the cascade is bypassed and the element is driven
-        open-loop at Max_Output. Above Max_Pump_Temp the pump stops. If the
-        pump threshold is the lower of the two, crossing it produces **full
-        power with no circulation**: on a HERMS the coil has no flow, so the
-        heat does not reach the mash, the mash does not climb to the next
-        threshold, and the element stays at Max_Output.
+    def _limit_alert(self, key, reading, limit, describe):
+        """Tell the brewer, once, when a limit takes over from the controller.
 
-        Found by an independent review of a setup table that recommended
-        Max_PID_Temp and Max_Pump_Temp at the SAME value, which lands exactly
-        on this. Documenting it was not enough - the ordering is checkable, so
-        it is checked.
+        Past Max_PID_Temp (or Max_Boil_Temp) the element runs at a fixed power
+        with nothing regulating it; past Max_Pump_Temp the pump stops and the
+        coil carries no heat. Both used to happen silently - the pump stop was
+        a debug line, and the switch to fixed power was nothing at all.
 
-        A warning rather than a refusal. Both thresholds normally sit far above
-        any mash temperature, so this is a latent misconfiguration rather than
-        a live fault, and refusing to start a logic that would otherwise mash
-        correctly is its own kind of ruined day.
+        This replaces a start-up check that compared the two settings. That
+        fired at every start on the stock defaults, which are equal, about a
+        state a HERMS mash never reaches - and stayed quiet at settings that
+        still reach it. Announcing a limit when it engages is right at both
+        ends: never on a normal mash, always when it happens, whatever the
+        settings. On a mash that cannot be near 190 F, it is also how a lying
+        probe gets noticed.
+
+        Re-arms once the mash falls LIMIT_REARM_MARGIN below the limit. Never
+        raises: an alert must not be the reason control stops.
         """
         try:
-            pid_t = float(self.max_pid_temp)
-            pump_t = float(self.max_pump_temp)
+            reading = float(reading)
+            limit = float(limit)
         except (TypeError, ValueError):
             return
-        if pump_t > pid_t:
+        if not (math.isfinite(reading) and math.isfinite(limit)):
             return
-        unit = getattr(self, "TEMP_UNIT", "")
-        message = (
-            "Max_Pump_Temp ({:g}) is not above Max_PID_Temp ({:g}). Above "
-            "{:g} {} the element is driven open-loop at full output, and at "
-            "or above {:g} the pump stops - so that range is full power with "
-            "no circulation. Raise Max_Pump_Temp above Max_PID_Temp."
-            .format(pump_t, pid_t, pid_t, unit, pump_t)
-        )
-        self._logger.warning("PIDHerms: %s", message)
+        announced = getattr(self, "_limits_announced", None)
+        if announced is None:
+            announced = self._limits_announced = set()
+        if reading < limit:
+            if reading < limit - self.LIMIT_REARM_MARGIN:
+                announced.discard(key)
+            return
+        if key in announced:
+            return
+        announced.add(key)
         try:
-            self.cbpi.notify(
-                "{} configuration".format(getattr(self.kettle, "name", "Mash")),
-                message,
-                NotificationType.WARNING,
+            message = describe()
+            getattr(self, "_logger", logging.getLogger(type(self).__name__)).warning(
+                "PIDHerms: %s", message
             )
-        except Exception:  # noqa: BLE001
+            self.cbpi.notify("PIDHerms", message, NotificationType.WARNING)
+        except Exception:  # noqa: BLE001 - never let an alert stop control
             pass
+
+    def _fixed_power_alert(self, current_temp):
+        """Announce the element leaving temperature control for a fixed power."""
+        try:
+            resume = min(float(self.max_pid_temp), float(self.max_boil_temp))
+        except (TypeError, ValueError):
+            return
+
+        def describe():
+            unit = getattr(self, "TEMP_UNIT", "")
+            if current_temp >= self.max_boil_temp:
+                name, limit, power = (
+                    "Max_Boil_Temp", self.max_boil_temp, self.max_output_boil
+                )
+            else:
+                name, limit, power = (
+                    "Max_PID_Temp", self.max_pid_temp, self.max_output
+                )
+            return (
+                "Mash is at {:.1f} {u}, at or above {} ({:g} {u}): the element "
+                "is running at a fixed {:g}% with no temperature control, and "
+                "nothing limits the HLT temperature. Control resumes below "
+                "{:g} {u}. If the mash is not really that hot, check its probe."
+                .format(float(current_temp), name, float(limit), float(power),
+                        resume, u=unit)
+            )
+
+        self._limit_alert("fixed_power", current_temp, resume, describe)
+
+    def _pump_limit_alert(self, reading):
+        """Announce the pump stopping because the mash reached Max_Pump_Temp."""
+
+        def describe():
+            unit = getattr(self, "TEMP_UNIT", "")
+            limit = float(self.max_pump_temp)
+            return (
+                "Mash is at {:.1f} {u}, at or above Max_Pump_Temp ({:g} {u}): "
+                "the pump is stopped, so no heat moves through the coil. It "
+                "restarts below {:g} {u}. If the mash is not really that hot, "
+                "check its probe.".format(float(reading), limit, limit, u=unit)
+            )
+
+        self._limit_alert("pump", reading, self.max_pump_temp, describe)
 
     def _delta_prop(self):
         """Read DeltaTemp, taking the configured value literally.
@@ -882,7 +929,9 @@ class PID_HERMS(CBPiKettleLogic):
             else:
                 pump_on = False
             # if the current temp is below the max pump temp, check if pause time is reached to pause pump
-            if self.get_sensor_value(self.kettle.sensor).get("value") < self.max_pump_temp:
+            reading = self.get_sensor_value(self.kettle.sensor).get("value")
+            self._pump_limit_alert(reading)
+            if reading < self.max_pump_temp:
                 self._logger.debug("starting pump")
                 # Checked immediately before starting, not only at the top of
                 # the outer loop: a hold raised while the previous interval was
@@ -900,6 +949,14 @@ class PID_HERMS(CBPiKettleLogic):
                     # The hold branch at the top of the loop does the switching
                     # off, so it sees a consistent state either way.
                     continue
+                if reason == "max_temp":
+                    # Announced now, not after the rest that follows.
+                    try:
+                        self._pump_limit_alert(
+                            self.get_sensor_value(self.kettle.sensor).get("value")
+                        )
+                    except Exception:  # noqa: BLE001 - a read here is not fatal
+                        pass
 
                 # Rests are optional. The pumps on plenty of rigs are rated for
                 # continuous duty, and the rest is not free: while it is resting
@@ -1065,6 +1122,8 @@ class PID_HERMS(CBPiKettleLogic):
                     NotificationType.INFO,
                 )
             sensor_fault_notified = None
+
+            self._fixed_power_alert(current_temp)
 
             # if current temperature is higher than the defined boil temp, use a fixed
             # heating percent instead of PID values for controlled boiling
@@ -1414,7 +1473,8 @@ class PID_HERMS(CBPiKettleLogic):
             self.max_boil_temp = self._temperature_prop("Max_Boil_Temp", 98)
             self.max_pid_temp = self._temperature_prop("Max_PID_Temp", 88)
             self.max_pump_temp = self._temperature_prop("Max_Pump_Temp", 88)
-            self._check_threshold_order()
+            # Each start announces a limit afresh if the mash is already past it.
+            self._limits_announced = set()
 
             # Resolved at the top of run(), before anything fallible.
             self.sensor = self.props.get("HLT_Sensor", None)
