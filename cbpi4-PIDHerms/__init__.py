@@ -13,6 +13,8 @@ import datetime
                              description="Width of the HLT overshoot band, in the configured temperature unit. The mash (outer) PID raises the HLT setpoint up to mash_target + DeltaTemp when it wants heat, and eases it back toward mash_target as the mash reaches setpoint, so at rest the HLT sits close to the mash temperature. A HERMS only moves heat while the HLT is hotter than the wort, so this must be greater than 0; values of 0 or less are raised to a small floor. System-dependent (insulation, hose length/run, HERMS coil surface area and efficiency) - tune it to your rig. Lower tracks the mash more tightly and is gentler on enzymes but ramps slower; higher ramps faster but risks denaturing enzymes in the coil."),
              Property.Number(label="MashIn_DeltaTemp", configurable=True,
                              description="Width of the HLT overshoot band while the mash tun holds only water, i.e. during Mash In before the grain goes in. DeltaTemp is a compromise between ramp rate and not cooking enzymes in the coil - but there are no enzymes in the tun yet, so that compromise is being paid for nothing. Measured on a 30 L / 6.5 kW HERMS heating tap water to a 163 F strike: at DeltaTemp 5.4 F the ramp takes 64 min and 13.6 of those are spent on the final 5 F; at 12 F it is 54 min with 5.2 on the final 5 F. Returns flatten past about 18 F because the element saturates. Leave blank to use DeltaTemp and change nothing. The wider band applies only from the start of Mash In until strike temperature is reached, which is exactly the window in which the tun is known to be grain-free."),
+             Property.Number(label="MashIn_Pump_Within", configurable=True,
+                             description="Mash In only, while the tun holds water and no grain: keep the pump off and heat the HLT alone until it is within this many degrees of the mash target, then circulate - so hot water runs through the hoses for the end of the heat-up only, which is worth having for an unattended start such as BrewStart's Ready by. The element runs flat out either way, so the heat-up takes about as long. Set it wider than the HLT element's proportional band, about 100 / HLT_P degrees, or the element backs off while it waits. If the HLT stops warming while it waits, the pump starts anyway, with a warning. Leave blank to circulate from the start, as before."),
              Property.Number(label="P", configurable=True, default_value=2.0,
                              description="P value of the mash (outer) PID, in degrees of HLT offset per degree of mash error. NOTE: these are NOT heater-percent gains and must not be taken from the PID AutoTune plugin - use HLT_P/HLT_I/HLT_D for that."),
              Property.Number(label="I", configurable=True, default_value=0.005,
@@ -126,6 +128,15 @@ class PID_HERMS(CBPiKettleLogic):
     # size. A HERMS with the HLT half a degree above the mash is delivering, just
     # slowly.
     HEAT_FLOW_MARGIN = 0.5
+
+    # While MashIn_Pump_Within holds the pump for the HLT to warm, nothing else
+    # watches the HLT: the step's heat-stall watch is told no heat can reach the
+    # mash, which with the pump off is true. So this does. Less rise than this,
+    # for this long, with the element on, is an HLT that is not heating - the
+    # selector left on the boil kettle, a dead element or SSR - and an
+    # unattended start would otherwise sit there until somebody came to look.
+    MASHIN_WAIT_STALL_SECONDS = 600
+    MASHIN_WAIT_MIN_RISE = 0.5
 
     #: Reported to anything that wants to know whether heat can reach the mash
     #: right now - the step's heat-stall watch in particular. Starts True so a
@@ -275,7 +286,9 @@ class PID_HERMS(CBPiKettleLogic):
         self._sensor_watch = {}
         self.sensor_stale_seconds = self.DEFAULT_SENSOR_STALE_SECONDS
         self.pump_rest_enabled = True
-
+        self.mashin_pump_within = None
+        self._mashin_pump_started = False
+        self._mashin_wait = None
     def _mash_is_climbing(self, current_temp):
         """Has the mash risen measurably since the last confirmed rise?
 
@@ -864,6 +877,109 @@ class PID_HERMS(CBPiKettleLogic):
         self._hlt_kettle = None
         self._hlt_target_before = None
     
+    def _mashin_pump_waiting(self):
+        """Mash-in, water only: is the pump waiting for the HLT to near the target?
+
+        With MashIn_Pump_Within set, the pump stays off while the tun holds only
+        water and the HLT is still more than that far below the mash target, so
+        hot water runs through the hoses for the end of the heat-up only. The
+        element runs flat out meanwhile - the HLT setpoint is clamped to the
+        mash target while nothing flows, and the wait ends before the HLT gets
+        close enough for the element to back off.
+
+        Once the pump has started it runs until the grain goes in, however far
+        the cold water from the tun pulls the HLT back down: a pump that
+        stopped again would only take turns with the element.
+
+        Never waits on what it cannot read. No target, or no fresh HLT reading,
+        means circulate as before.
+        """
+        within = getattr(self, "mashin_pump_within", None)
+        if not within:
+            return False
+        if getattr(self, "grain_present", True):
+            # Grain in, or not mashing in at all: the next mash-in waits afresh.
+            self._mashin_pump_started = False
+            self._mashin_wait = None
+            return False
+        if getattr(self, "_mashin_pump_started", False):
+            return False
+        try:
+            target = float(self.get_kettle_target_temp(self.id))
+            reading = self.get_sensor_value(self.sensor)
+            hlt = float(reading.get("value"))
+            age, max_age = reading.get("age"), reading.get("max_age")
+            if age is not None and max_age is not None and float(age) > float(max_age):
+                raise ValueError("stale HLT reading")
+        except Exception:  # noqa: BLE001 - unreadable: circulate, as before
+            return self._start_mashin_pump(None, None, "unreadable")
+        if not (math.isfinite(target) and math.isfinite(hlt)):
+            return self._start_mashin_pump(None, None, "unreadable")
+        if hlt >= target - within:
+            return self._start_mashin_pump(hlt, target, "near")
+        now = clock.now()
+        wait = getattr(self, "_mashin_wait", None)
+        if wait is None:
+            self._mashin_wait = {"anchor": hlt, "since": now}
+            self._announce_mashin_wait(hlt, target)
+            return True
+        if hlt >= wait["anchor"] + self.MASHIN_WAIT_MIN_RISE:
+            wait["anchor"], wait["since"] = hlt, now
+        elif now - wait["since"] >= self.MASHIN_WAIT_STALL_SECONDS:
+            on, power, known = self._heater_now()
+            try:
+                driven = known and on and (power is None or float(power) >= 50)
+            except (TypeError, ValueError):
+                driven = known and on
+            return self._start_mashin_pump(hlt, target, "stalled" if driven else "settled")
+        return True
+
+    def _start_mashin_pump(self, hlt, target, why):
+        """End the mash-in wait: from here the pump runs until the grain goes in."""
+        self._mashin_pump_started = True
+        self._mashin_wait = None
+        unit = getattr(self, "TEMP_UNIT", "C")
+        if why == "near":
+            message = ("HLT at {:.1f} {u}, within {:g} {u} of the {:.1f} {u} mash "
+                       "target: starting the pump.").format(
+                           hlt, self.mashin_pump_within, target, u=unit)
+            kind = NotificationType.INFO
+        elif why == "stalled":
+            message = ("The HLT has not warmed in {} minutes with its element on - it "
+                       "is at {:.1f} {u}. Check the selector, the element and its SSR. "
+                       "Starting the pump, so the mash-in carries on as it would "
+                       "have.").format(int(self.MASHIN_WAIT_STALL_SECONDS // 60), hlt, u=unit)
+            kind = NotificationType.WARNING
+        elif why == "settled":
+            message = ("HLT holding at {:.1f} {u}, short of the {:.1f} {u} it waits "
+                       "for: starting the pump.").format(
+                           hlt, target - self.mashin_pump_within, u=unit)
+            kind = NotificationType.INFO
+        else:
+            logging.warning("PIDHerms: MashIn_Pump_Within cannot read the HLT or the "
+                            "mash target - circulating from now, as before")
+            return False
+        logging.log(logging.WARNING if kind == NotificationType.WARNING else logging.INFO,
+                    "PIDHerms: %s", message)
+        try:
+            self.cbpi.notify("PIDHerms", message, kind)
+        except Exception:  # noqa: BLE001 - a notification must not stop the pump
+            pass
+        return False
+
+    def _announce_mashin_wait(self, hlt, target):
+        unit = getattr(self, "TEMP_UNIT", "C")
+        message = ("Mash In: heating the HLT first. The pump starts when the HLT "
+                   "reaches {:.1f} {u}, {:g} {u} below the {:.1f} {u} mash target; it "
+                   "is at {:.1f} {u}.").format(
+                       target - self.mashin_pump_within, self.mashin_pump_within,
+                       target, hlt, u=unit)
+        logging.info("PIDHerms: %s", message)
+        try:
+            self.cbpi.notify("PIDHerms", message, NotificationType.INFO)
+        except Exception:  # noqa: BLE001
+            pass
+
     # subroutine that controlls pump aue and ump stop if max pump temp is reached
     async def _pump_wait(self, seconds, sensor_check=False):
         """Wait, but stay responsive to a hold or a stop.
@@ -888,6 +1004,9 @@ class PID_HERMS(CBPiKettleLogic):
             if not self.running:
                 return "stopped"
             if getattr(self, "pump_hold", False):
+                return "hold"
+            # A mash-in that starts while the pump is mid-interval waits too.
+            if self._mashin_pump_waiting():
                 return "hold"
             if sensor_check:
                 try:
@@ -921,6 +1040,17 @@ class PID_HERMS(CBPiKettleLogic):
                         await self.actor_off(self.agitator)
                 except Exception as e:  # noqa: BLE001
                     self._logger.error("pump hold could not stop the pump: %s", e)
+                await clock.sleep(1)
+                continue
+            # Mash-in with MashIn_Pump_Within set: heat the HLT alone until it
+            # nears the mash target, then circulate. Off the same way as a hold.
+            if self._mashin_pump_waiting():
+                try:
+                    if (self.pump is not None and self.pump.instance
+                            and self.pump.instance.state):
+                        await self.actor_off(self.agitator)
+                except Exception as e:  # noqa: BLE001
+                    self._logger.error("mash-in wait could not stop the pump: %s", e)
                 await clock.sleep(1)
                 continue
             # get current pump status
@@ -1435,6 +1565,23 @@ class PID_HERMS(CBPiKettleLogic):
                 self.grain_present = True
             if not hasattr(self, "pump_hold"):
                 self.pump_hold = False
+            # Mash-in only: heat the HLT alone until it nears the mash target.
+            # Blank means circulate from the start, so nothing changes for
+            # anyone who does not set it.
+            self.mashin_pump_within = None
+            within = self.props.get("MashIn_Pump_Within", None)
+            if within not in (None, ""):
+                try:
+                    value = float(within)
+                    if math.isfinite(value) and value > 0:
+                        self.mashin_pump_within = value
+                except (TypeError, ValueError):
+                    logging.warning(
+                        "PIDHerms: could not parse MashIn_Pump_Within=%r, "
+                        "circulating from the start", within
+                    )
+            self._mashin_pump_started = False
+            self._mashin_wait = None
             self._active_band = self.delta
             if self.mashin_delta != self.delta:
                 logging.info(
