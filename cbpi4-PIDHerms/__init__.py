@@ -160,10 +160,10 @@ class PID_HERMS(CBPiKettleLogic):
         to superheating static wort, and a brewer who wants a faster ramp should
         shorten the rest rather than cook the coil.
 
-        This is a method rather than two inline lines so that it can be called
-        directly. The test for it used to recompute `min(setpoint, target)` in
-        its own body and assert on that arithmetic, which passes whatever
-        production does - including deleting the clamp entirely.
+        This is a method rather than two inline lines so that a test can call
+        it directly. A test that recomputes `min(setpoint, target)` in its own
+        body and asserts on that arithmetic passes whatever production does -
+        including deleting the clamp entirely.
         """
         if not self._pump_is_running():
             return min(hlt_setpoint, target_temp)
@@ -174,7 +174,7 @@ class PID_HERMS(CBPiKettleLogic):
 
         A HERMS coil transfers heat only while the mash is being recirculated.
         With no agitator configured the rig is assumed to circulate some other
-        way, which keeps a differently-plumbed system behaving as it did.
+        way, so the coil always counts as carrying heat.
         """
         # getattr, not direct access: this can be reached before run() has
         # assigned the agitator, and a temperature controller must not fall over
@@ -194,30 +194,28 @@ class PID_HERMS(CBPiKettleLogic):
 
         While a HERMS mash is running, the HLT is not being controlled to its
         own configured target - it is being driven to whatever offset the outer
-        loop currently wants. The interface still showed the configured number,
-        which during a mash is stale and means nothing: a brewer looking at the
-        HLT sees 168.8 while the cascade is actually asking for 157.
+        loop currently wants. The configured number is stale during a mash and
+        means nothing: shown instead, a brewer looking at the HLT would see
+        168.8 while the cascade is actually asking for 157.
 
         Named explicitly by HLT_Kettle when set, otherwise found by matching the
         HLT sensor - the same sensor the inner loop already reads, so a rig
         wired sensibly needs nothing configured.
 
-        The field was briefly withdrawn because it rendered as an unlabelled
-        "Kettle" picker inside the Mash Tun's own settings, which reads like
-        nonsense. That was a UI bug rather than a naming one: PropsEdit.js
-        passed label= for text, number and select fields but not for kettle,
-        sensor, actor or fermenter, so all four fell back to their component's
-        default. It is why the HLT sensor field said only "Sensor" too.
+        The field needs an interface whose PropsEdit.js passes label= to kettle,
+        sensor, actor and fermenter fields, not only to text, number and select
+        ones. Without that it shows as an unlabelled "Kettle" picker inside the
+        Mash Tun's own settings, and the HLT sensor field as just "Sensor".
         """
         kettle_id = self.props.get("HLT_Kettle", None)
         try:
             if kettle_id:
                 # Never this kettle, however it was chosen.
                 #
-                # The sensor fallback below has always refused to select the
-                # controlled kettle; the explicit picker did not, and it offers
-                # every kettle including this one. Choosing the mash tun is an
-                # ordinary configuration mistake with an extraordinary
+                # The sensor fallback below refuses to select the controlled
+                # kettle, and this does the same for the explicit picker, which
+                # offers every kettle including this one. Choosing the mash tun
+                # is an ordinary configuration mistake with an extraordinary
                 # consequence: _publish_hlt_setpoint writes the commanded HLT
                 # target onto the selected kettle, so the mash setpoint becomes
                 # the outer loop's own output and the next iteration reads it
@@ -389,12 +387,9 @@ class PID_HERMS(CBPiKettleLogic):
         opens the kettle properties on a Fahrenheit rig and saves without
         editing persists Max_Pump_Temp='88' - which was authored as Celsius.
 
-        This originally resolved that by treating a value EQUAL to the
-        historical Celsius default as unset. An independent review called that
-        out, correctly: it cannot tell a stale default from a deliberate entry.
-        The first attempt at a fix went the other way and made every configured
-        value literal - and that is worse, because the two errors are not
-        symmetric:
+        Treating a value EQUAL to the Celsius default as unset cannot tell a
+        stale default from a deliberate entry. Taking every configured value
+        literally is worse, because the two errors are not symmetric:
 
           - reading a deliberate 3 as 5.4 widens a band. Wrong, harmless.
           - reading a persisted 88 as 88 F stops the pump for the whole mash,
@@ -402,13 +397,11 @@ class PID_HERMS(CBPiKettleLogic):
 
         So absolutes are guarded by PLAUSIBILITY rather than by equality. A
         threshold below IMPLAUSIBLE_F_THRESHOLD cannot be a Fahrenheit value
-        anyone intended, whether it came from the old default or a typo - which
-        makes this strictly broader than the equality test it replaces, since
-        95 was taken literally before.
+        anyone intended, whether it came from the Celsius default or a typo -
+        so this catches more than an equality test would: a typed 95, too.
 
-        Either way the brewer is now TOLD, by notification rather than a log
-        line nobody reads. Being overridden silently was the part nobody
-        defended.
+        Either way the brewer is TOLD, by notification rather than a log line
+        nobody reads: a value is never overridden silently.
         """
         default = self._temp_default(celsius_default)
         value = self.props.get(name, None)
@@ -464,16 +457,14 @@ class PID_HERMS(CBPiKettleLogic):
 
         Past Max_PID_Temp (or Max_Boil_Temp) the element runs at a fixed power
         with nothing regulating it; past Max_Pump_Temp the pump stops and the
-        coil carries no heat. Both used to happen silently - the pump stop was
-        a debug line, and the switch to fixed power was nothing at all.
+        coil carries no heat. Neither should happen silently.
 
-        This replaces a start-up check that compared the two settings. That
-        fired at every start on the stock defaults, which are equal, about a
-        state a HERMS mash never reaches - and stayed quiet at settings that
-        still reach it. Announcing a limit when it engages is right at both
-        ends: never on a normal mash, always when it happens, whatever the
-        settings. On a mash that cannot be near 190 F, it is also how a lying
-        probe gets noticed.
+        A start-up check that compares the two settings would fire at every
+        start on the stock defaults, which are equal, about a state a HERMS
+        mash never reaches - and stay quiet at settings that still reach it.
+        Announcing a limit when it engages is right at both ends: never on a
+        normal mash, always when it happens, whatever the settings. On a mash
+        that cannot be near 190 F, it is also how a lying probe gets noticed.
 
         Re-arms once the mash falls LIMIT_REARM_MARGIN below the limit. Never
         raises: an alert must not be the reason control stops.
@@ -550,12 +541,11 @@ class PID_HERMS(CBPiKettleLogic):
     def _delta_prop(self):
         """Read DeltaTemp, taking the configured value literally.
 
-        This is the case that made the old equality heuristic indefensible.
-        DeltaTemp is the HLT overshoot band, and **3 F is a perfectly sensible
-        band** - tighter mash tracking, gentler on the enzymes in the coil. A
-        brewer who typed 3 on a Fahrenheit rig silently got 5.4, nearly double
-        what they asked for, with no way to express 3 short of typing
-        3.000001.
+        This is the case an equality heuristic gets wrong. DeltaTemp is the
+        HLT overshoot band, and **3 F is a perfectly sensible band** - tighter
+        mash tracking, gentler on the enzymes in the coil. Converting a 3 typed
+        on a Fahrenheit rig would silently give 5.4, nearly double what was
+        asked for, with no way to express 3 short of typing 3.000001.
 
         The conversion is still the right DEFAULT, because an untouched field
         really does hold the authored Celsius 3. So: blank takes the unit-aware
@@ -738,8 +728,8 @@ class PID_HERMS(CBPiKettleLogic):
             # step, and an epsilon that deliberately treats adjacent counts as
             # unchanged, it is the normal case rather than an edge case.
             #
-            # Observed: a mash held at 152.60 F tripped the watch after 301s and
-            # the heater was switched off mid-rest. Left alone it sawtooths for
+            # A mash held at 152.60 F would trip such a watch after 301s and
+            # switch the heater off mid-rest. Left alone it sawtooths for
             # the whole rest - off, sag, "readings restored", on, settle, off -
             # across the phase where stable temperature decides fermentability.
             #
@@ -753,14 +743,13 @@ class PID_HERMS(CBPiKettleLogic):
             # Nothing else counts as recovery, and a change of target least of
             # all. The fault handler publishes the HLT target down to the mash
             # target when it cuts heat; without this latch the next iteration
-            # judged the still-frozen reading against that LOWERED target,
-            # found it at or above, reset the window, announced "Temperature
-            # readings restored" and resumed heating. Measured against the real
-            # cascade with a frozen HLT: OFF at 305s, ON at 310s, OFF at 615s,
-            # ON at 620s, with neither reading ever changing - the same
-            # sawtooth this watch was rewritten to stop, re-entered by a
-            # different door, and an interface asserting a recovery that had
-            # not happened.
+            # would judge the still-frozen reading against that LOWERED target,
+            # find it at or above, reset the window, announce "Temperature
+            # readings restored" and resume heating. Against the real cascade
+            # with a frozen HLT that is OFF at 305s, ON at 310s, OFF at 615s,
+            # ON at 620s, with neither reading ever changing - the sawtooth
+            # this watch exists to stop, by a different door, and an interface
+            # asserting a recovery that has not happened.
             if watched.get("faulted"):
                 return None, self._stale_message(
                     label, value, now - watched["changed_at"], stale_seconds
@@ -774,17 +763,16 @@ class PID_HERMS(CBPiKettleLogic):
             # step, and an epsilon that deliberately treats adjacent counts as
             # unchanged, it is the normal case rather than an edge case.
             #
-            # Observed: a mash held at 152.60 F tripped the watch after 301s and
-            # the heater was switched off mid-rest. Left alone it sawtooths for
+            # A mash held at 152.60 F would trip such a watch after 301s and
+            # switch the heater off mid-rest. Left alone it sawtooths for
             # the whole rest - off, sag, "readings restored", on, settle, off -
             # across the phase where stable temperature decides fermentability.
             #
             # So the window only accrues while the reading sits far enough below
             # target to be expected to climb.
             #
-            # This narrowing has a real cost, stated plainly because an earlier
-            # version of this comment got it wrong: a probe frozen *at* setpoint
-            # is no longer detected here, and nothing else detects it either.
+            # This narrowing has a real cost: a probe frozen *at* setpoint is
+            # not detected here, and nothing else detects it either.
             #
             # The age check above does not cover it. Age measures republishing,
             # not measurement: a driver that keeps publishing a stale value
@@ -802,21 +790,21 @@ class PID_HERMS(CBPiKettleLogic):
             # Thermal overshoot, a hot starting state, or a fault in the HLT's
             # own probe or actuator all void that, and nothing in this function
             # would notice - it sees one sensor at a time.
-            # See DEFECTS.md M4 - detecting it needs independent evidence, which
-            # this function does not have.
+            # Detecting it needs independent evidence, which this function does
+            # not have.
             if not heat_path_open:
-                # Measured on the e2e rig, and it is the dough-in window that
-                # makes this reachable rather than some exotic fault.
+                # The dough-in window makes this reachable, not some exotic
+                # fault.
                 #
                 # MashInStep stops the pump the moment strike temperature is
                 # reached - deliberately, so grain goes into a still tun - and
                 # then waits for a human. With the coil carrying nothing the
                 # mash drifts, slowly, towards room temperature: 112.04 ->
-                # 111.20 F over eight minutes in the recorded run. That is
-                # under the 0.12 F epsilon per 300 s window, so the watch read
-                # a vessel it had itself been told to isolate as a frozen probe
-                # and logged "Mash sensor has been unchanged at 112.04 for
-                # 301s - heater turned off" eight times while the brewer was
+                # 111.20 F over eight minutes on the e2e rig. That is under the
+                # 0.12 F epsilon per 300 s window, so the watch would read a
+                # vessel it had itself been told to isolate as a frozen probe,
+                # and log "Mash sensor has been unchanged at 112.04 for 301s -
+                # heater turned off" again and again while the brewer is
                 # doughing in.
                 #
                 # The epsilon is what makes a drift indistinguishable from a
@@ -984,11 +972,10 @@ class PID_HERMS(CBPiKettleLogic):
     async def _pump_wait(self, seconds, sensor_check=False):
         """Wait, but stay responsive to a hold or a stop.
 
-        The pump's work interval was a loop that only ever tested the
-        temperature, and its rest was a single clock.sleep of the whole rest
-        time. Neither looked at pump_hold or at self.running, so a hold raised
-        one second into a 600 second interval left the pump recirculating for
-        the remaining 599.
+        A work interval that only tests the temperature, or a rest that is a
+        single clock.sleep of the whole rest time, looks at neither pump_hold
+        nor self.running, so a hold raised one second into a 600 second
+        interval would leave the pump recirculating for the remaining 599.
 
         That defeats the entire point of the hold. Mash-in raises it the moment
         strike is reached so the grain goes into a still tun and so the ramp
@@ -1103,9 +1090,9 @@ class PID_HERMS(CBPiKettleLogic):
                 # pause pump when active pump Interval is completed
                 self._logger.debug("resting pump")
                 await self.actor_off(self.agitator)
-                # Interruptible for the same reason as the interval above: this
-                # was a single sleep of the whole rest time, so a stop during a
-                # rest waited it out before anything else could happen.
+                # Interruptible for the same reason as the interval above: as a
+                # single sleep of the whole rest time, a stop during a rest
+                # would wait it out before anything else could happen.
                 await self._pump_wait(self.rest_time)
             # If temeprature is above max pump temp, and pump is on, switch it off
             # Staops also the pump if user switches it on and temp is abouve max pump temp
@@ -1120,7 +1107,7 @@ class PID_HERMS(CBPiKettleLogic):
     async def temp_control(self):
         # Deliberately not actor_on(heater, 0) here. A plain GPIOActor's on()
         # drives the pin HIGH immediately and ignores the power argument, so that
-        # call energized the element before any demand existed.
+        # call would energize the element before any demand existed.
         #
         # Switching it off instead establishes the same known starting state
         # without the pulse, and matters because actor state survives a restart:
@@ -1329,11 +1316,10 @@ class PID_HERMS(CBPiKettleLogic):
                 if saturated and self._mash_is_climbing(current_temp):
                     # Pinned at the band limit, but the mash is still rising, so
                     # the band is still delivering heat and there is nothing to
-                    # warn about. Reset rather than pause: an earlier version
-                    # only paused the clock here, which still accumulated on the
-                    # samples between confirmed rises and so warned partway
-                    # through every ordinary ramp - the exact false positive this
-                    # check exists to prevent.
+                    # warn about. Reset rather than pause: a paused clock still
+                    # accumulates on the samples between confirmed rises, and so
+                    # warns partway through every ordinary ramp - the exact false
+                    # positive this check exists to prevent.
                     saturated_seconds = 0
                 elif saturated:
                     saturated_seconds += self.sample_time
@@ -1358,15 +1344,15 @@ class PID_HERMS(CBPiKettleLogic):
             # Drive the actor from what it IS doing, not from what this loop
             # last told it to do.
             #
-            # heater_is_on and heat_percent_old were locals and the loop
-            # commanded only on a believed transition, so anything else
-            # touching the actor left it wrong for the rest of the brew: switch
-            # the element off from the dashboard and the loop went on believing
-            # it was driving it and never commanded again.
+            # Commanding only on a transition believed from locals such as
+            # heater_is_on and heat_percent_old would leave the loop wrong for
+            # the rest of the brew once anything else touched the actor: switch
+            # the element off from the dashboard and the loop would go on
+            # believing it was driving it and never command again.
             #
             # ActorController.set_power() only forwards a number to the
             # instance; it never changes state. For a plain GPIOActor that
-            # means a demand of 0% left the actor nominally on at 0% duty
+            # means a demand of 0% would leave the actor nominally on at 0% duty
             # rather than genuinely off, which is why the off below exists at
             # all. The dwell keeps it from chattering around zero demand.
             actual_on, actual_power, known = self._heater_now()
@@ -1385,9 +1371,9 @@ class PID_HERMS(CBPiKettleLogic):
             else:
                 zero_demand_samples += 1
                 if zero_demand_samples >= self.OFF_DWELL_SAMPLES:
-                    # Unconditional once the dwell has passed: this was guarded
-                    # on the local flag, so a swallowed failure flipped it and
-                    # the loop never retried.
+                    # Unconditional once the dwell has passed: if this were
+                    # guarded on the local flag, a swallowed failure would flip
+                    # it and the loop would never retry.
                     await self.actor_off(self.heater)
                     heater_is_on = False
                     heat_percent_old = 0
@@ -1453,21 +1439,19 @@ class PID_HERMS(CBPiKettleLogic):
             # Identify the actuators and establish the heater off BEFORE
             # anything that can fail.
             #
-            # This used to sit about a hundred lines down, after every setting
-            # had been parsed. Those parses can raise - int("abc") on a
-            # SampleTime, float("") on a rest interval, a kettle that cannot be
-            # resolved - and when they did, run() went straight to its finally,
-            # which looks for the heater with getattr(self, "heater", None),
-            # found it had never been assigned, and skipped. Not a crash: a
-            # silent skip.
+            # Every setting is parsed after this, and those parses can raise -
+            # int("abc") on a SampleTime, float("") on a rest interval, a kettle
+            # that cannot be resolved. Were the heater resolved after them,
+            # run() would go straight to its finally, which looks for the
+            # heater with getattr(self, "heater", None), find it had never been
+            # assigned, and skip. Not a crash: a silent skip.
             #
             # On a rig driven by hand that is the dangerous case. The brewer
             # switches an element on manually, then starts the kettle logic; a
             # malformed setting aborts the startup; the element keeps running
             # at whatever it was, with no control loop, no sensor being read
             # and no limits - while the interface shows the logic as stopped.
-            # Measured: actor_off was never called once and a 70% element
-            # stayed at 70%.
+            # actor_off is never called, and a 70% element stays at 70%.
             #
             # Resolving the actuator is the one thing that must happen before
             # anything is allowed to go wrong, because it is what makes the
@@ -1502,12 +1486,11 @@ class PID_HERMS(CBPiKettleLogic):
             #
             # Timing goes through cbpi.api.clock rather than the wall clock, so this
             # loop states its period in brewing seconds and has no idea whether it
-            # is being simulated. On hardware the clock is real time and this is
-            # exactly what it always was.
+            # is being simulated. On hardware the clock is real time.
             #
-            # Scaling each sleep here instead was the first attempt, and it put a
-            # simulator's config key into a hardware control path - a setting left
-            # at 60 would have run a real heater's integral sixty times fast.
+            # Scaling each sleep here instead would put a simulator's config key
+            # into a hardware control path - a setting left at 60 would run a
+            # real heater's integral sixty times fast.
             pid_clock = lambda: clock.now() * 1000.0
 
             self.delta = self._delta_prop()
@@ -1599,11 +1582,11 @@ class PID_HERMS(CBPiKettleLogic):
 
             self.work_time = float(self.props.get("Rest_Interval", 600))
             self.rest_time = float(self.props.get("Rest_Time", 60))
-            # Defaults to resting, so an existing configuration behaves exactly
-            # as it did. A rest time of zero also disables it, but only after
-            # switching the pump off and straight back on again every interval,
-            # which is a needless contactor cycle - this skips the rest
-            # entirely.
+            # Defaults to resting, so a configuration without the setting still
+            # rests its pump. A rest time of zero also disables it, but only
+            # after switching the pump off and straight back on again every
+            # interval, which is a needless contactor cycle - this skips the
+            # rest entirely.
             self.pump_rest_enabled = self.props.get("Pump_Rest", "Yes") != "No"
             self.max_output_boil = float(self.props.get("Max_Boil_Output", 85))
 
@@ -1646,19 +1629,19 @@ class PID_HERMS(CBPiKettleLogic):
             temp_controller = asyncio.create_task(self.temp_control())
             # Held on self so the finally can reach them.
             #
-            # These were locals, and the only cancellation was after
-            # asyncio.wait() returned normally. Cancel run() itself while it is
+            # As locals, cancelled only after asyncio.wait() returned normally,
+            # they would outlive a cancelled run(): cancel run() while it is
             # awaiting that call - which is what stopping a step does - and
-            # those lines never execute: CancelledError propagates straight
-            # past them to the handler below. Both children survive run()
-            # returning, and can then command the heater or the pump back on
-            # after the finally has switched them off.
+            # those lines never execute, because CancelledError propagates
+            # straight past them to the handler below. Both children would
+            # survive run() returning, and could then command the heater or the
+            # pump back on after the finally has switched them off.
             self._children = (pump_controller, temp_controller)
 
-            # Await both together. Awaiting the pump first meant a crash in
-            # temp_control() was never surfaced while the pump kept running, so
-            # run()'s heater-off finally was never reached and the element stayed
-            # on. Cancel the sibling as soon as either one stops.
+            # Await both together. Awaiting the pump first would leave a crash in
+            # temp_control() unsurfaced while the pump kept running, so run()'s
+            # heater-off finally would never be reached and the element would
+            # stay on. Cancel the sibling as soon as either one stops.
             done, pending = await asyncio.wait(
                 {pump_controller, temp_controller},
                 return_when=asyncio.FIRST_COMPLETED,
@@ -1784,11 +1767,11 @@ class PIDArduino(object):
         dInput = inputValue - self._lastInput
 
         # Anti-windup: stop integrating only when the integral is pushing further
-        # into the rail it is already against. Freezing whenever the output was
-        # saturated - regardless of direction - meant a controller that had
-        # bottomed out could not begin recovering until the proportional term
-        # alone lifted it off the rail, which on a slow thermal plant is a long
-        # steady-state error.
+        # into the rail it is already against. Freezing whenever the output is
+        # saturated - regardless of direction - would leave a controller that
+        # has bottomed out unable to begin recovering until the proportional
+        # term alone lifted it off the rail, which on a slow thermal plant is a
+        # long steady-state error.
         at_ceiling = self._lastOutput >= self._outputMax
         at_floor = self._lastOutput <= self._outputMin
         winding_up = (at_ceiling and error > 0) or (at_floor and error < 0)
