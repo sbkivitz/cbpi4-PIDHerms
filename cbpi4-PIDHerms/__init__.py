@@ -55,6 +55,13 @@ class PID_HERMS(CBPiKettleLogic):
     # The inner (HLT) loop must settle faster than the outer (mash) loop or the two
     # hunt against each other. The outer PID runs this many times slower.
     OUTER_LOOP_RATIO = 5
+    # SampleTime, the seconds between control decisions: the setting offers 2
+    # and 5, and anything from 1 to 60 is used as it is. Faster than once a
+    # second is faster than a probe gives a new reading. Slower than once a
+    # minute leaves the element as one decision set it for that long, and an
+    # infinite one would leave it for good.
+    MIN_SAMPLE_TIME = 1.0
+    MAX_SAMPLE_TIME = 60.0
     # Consecutive failed HLT reads tolerated before the heater is cut.
     MAX_HLT_READ_FAILURES = 5
     # Fallback if an older core does not tell us a sensor-specific max_age.
@@ -74,10 +81,6 @@ class PID_HERMS(CBPiKettleLogic):
     # band a competent PID holds, so anything inside it is a hold, not a stall.
     SENSOR_SETTLED_BAND_C = 0.5
     SENSOR_SETTLED_BAND_F = 0.9
-    # Consecutive zero-demand samples before the heater actor is switched off
-    # rather than merely held at 0%. Purely to stop a PID sitting at zero from
-    # chattering a contactor - at 0% duty no heat is produced either way.
-    OFF_DWELL_SAMPLES = 3
     # Outer gains are degrees of HLT offset per degree of mash error, so sane values
     # are single digits. Anything this large is almost certainly a heater-percent gain
     # carried over from a pre-0.0.7 config or from AutoTune.
@@ -251,7 +254,9 @@ class PID_HERMS(CBPiKettleLogic):
         Pushed over the websocket rather than saved. This is a transient
         commanded value, not the brewer's configuration: writing it to disk
         every sample would wear the card for nothing and would quietly overwrite
-        the number they actually set. on_stop puts the original back.
+        the number they actually set. on_stop puts the original back. A value
+        that is not a number is not shown: temp_control treats the demand it
+        leads to as a fault and publishes the mash target instead.
         """
         if getattr(self, "_hlt_kettle", None) is None:
             return
@@ -264,7 +269,7 @@ class PID_HERMS(CBPiKettleLogic):
         if getattr(self._hlt_kettle, "id", None) == self.id:
             return
         rounded = round(float(value), 1)
-        if self._hlt_kettle.target_temp == rounded:
+        if not math.isfinite(rounded) or self._hlt_kettle.target_temp == rounded:
             return
         self._hlt_kettle.target_temp = rounded
         try:
@@ -353,18 +358,30 @@ class PID_HERMS(CBPiKettleLogic):
             self._logger.debug("Could not carry integral state: %s", e)
 
     def _float_prop(self, name, default):
-        """Read a numeric property, falling back to default when it is missing, blank
-        or unparsable, so a cleared field in the UI cannot kill the control loop."""
+        """Read a numeric property, falling back to default when it is missing,
+        blank, unparsable or not a finite number.
+
+        A cleared field in the UI then cannot kill the control loop, and a
+        typed "nan" or "inf" cannot reach a PID or a limit: float() accepts
+        both, a NaN gain makes the PID's output NaN from its first pass on, and
+        an infinite one overflows it. A value that is set but cannot be used is
+        reported to the brewer, because the loop runs on the default rather
+        than on what was typed.
+        """
         value = self.props.get(name, None)
         if value is None or str(value).strip() == "":
             return float(default)
         try:
-            return float(value)
-        except (TypeError, ValueError):
-            self._logger.warning(
-                "PIDHerms: could not parse %s=%r, using %s", name, value, default
+            parsed = float(value)
+        except (TypeError, ValueError, OverflowError):
+            parsed = float("nan")
+        if not math.isfinite(parsed):
+            self._tell_config(
+                "{} is set to {!r}, which is not a usable number, so {:g} is "
+                "used instead.".format(name, value, float(default))
             )
             return float(default)
+        return parsed
 
     def _temp_default(self, celsius):
         """Return a temperature default in the configured unit."""
@@ -409,16 +426,14 @@ class PID_HERMS(CBPiKettleLogic):
             return default
         try:
             parsed = float(value)
-        except (TypeError, ValueError):
-            self._logger.warning(
-                "PIDHerms: could not parse %s=%r, using %.1f %s",
-                name, value, default, getattr(self, "TEMP_UNIT", ""),
-            )
-            return default
-        if parsed != parsed or parsed in (float("inf"), float("-inf")):
-            self._logger.warning(
-                "PIDHerms: %s=%r is not a usable number, using %.1f %s",
-                name, value, default, getattr(self, "TEMP_UNIT", ""),
+        except (TypeError, ValueError, OverflowError):
+            parsed = float("nan")
+        if not math.isfinite(parsed):
+            self._tell_config(
+                "{} is set to {!r}, which is not a usable number, so {:.1f} {} "
+                "is used instead.".format(
+                    name, value, default, getattr(self, "TEMP_UNIT", "")
+                )
             )
             return default
 
@@ -558,16 +573,14 @@ class PID_HERMS(CBPiKettleLogic):
             return default
         try:
             parsed = float(value)
-        except (TypeError, ValueError):
-            self._logger.warning(
-                "PIDHerms: could not parse DeltaTemp=%r, using %.1f %s",
-                value, default, getattr(self, "TEMP_UNIT", ""),
-            )
-            return default
-        if parsed != parsed or parsed in (float("inf"), float("-inf")):
-            self._logger.warning(
-                "PIDHerms: DeltaTemp=%r is not a usable number, using %.1f %s",
-                value, default, getattr(self, "TEMP_UNIT", ""),
+        except (TypeError, ValueError, OverflowError):
+            parsed = float("nan")
+        if not math.isfinite(parsed):
+            self._tell_config(
+                "DeltaTemp is set to {!r}, which is not a usable number, so "
+                "{:.1f} {} is used instead.".format(
+                    value, default, getattr(self, "TEMP_UNIT", "")
+                )
             )
             return default
         if (getattr(self, "TEMP_UNIT", "C") != "C"
@@ -985,8 +998,16 @@ class PID_HERMS(CBPiKettleLogic):
 
         Returns the reason it stopped waiting, so the caller can tell a
         completed interval from an interruption.
+
+        Given nothing to wait - a rest of 0 - it still yields once, so
+        pump_control, which goes round on these waits, can never go round
+        without letting the rest of CraftBeerPi run: temperature control, a
+        Stop, every other kettle.
         """
         deadline = clock.now() + max(0.0, float(seconds))
+        if clock.now() >= deadline:
+            await clock.sleep(0)
+            return "elapsed"
         while clock.now() < deadline:
             if not self.running:
                 return "stopped"
@@ -1116,9 +1137,9 @@ class PID_HERMS(CBPiKettleLogic):
         # off. The element is switched on below, once the loop asks for heat.
         await self.actor_off(self.heater)
         heater_is_on = False
-        zero_demand_samples = 0
         heat_percent_old = 0
         sensor_fault_notified = None
+        demand_fault_notified = False
         saturated_seconds = 0
         band_warning_sent = False
 
@@ -1212,7 +1233,6 @@ class PID_HERMS(CBPiKettleLogic):
                 self.heat_available = False
                 await self.actor_off(self.heater)
                 heater_is_on = False
-                zero_demand_samples = 0
                 heat_percent_old = 0
                 if target_temp is not None:
                     await self._publish_hlt_setpoint(target_temp)
@@ -1341,6 +1361,39 @@ class PID_HERMS(CBPiKettleLogic):
                 # HLT_Temp is known valid here - the blind case returned above.
                 heat_percent = self.hlt_pid.calc(self.HLT_Temp, hlt_setpoint)
 
+            # A demand that is not a number is a fault, whatever produced it -
+            # a gain large enough to overflow the arithmetic, or a PID holding
+            # a NaN, which it would otherwise hold for the rest of the brew. The
+            # element goes off at once and the brewer is told; both PIDs start
+            # again from nothing, so the first decision made from good numbers
+            # heats as a new controller would.
+            if not math.isfinite(heat_percent):
+                await self.actor_off(self.heater)
+                heater_is_on = False
+                heat_percent_old = 0
+                self.pid.reset()
+                self.hlt_pid.reset()
+                await self._publish_hlt_setpoint(target_temp)
+                if not demand_fault_notified:
+                    demand_fault_notified = True
+                    message = (
+                        "The PID's output is not a number - heater turned off. "
+                        "Check P, I and D, and HLT_P, HLT_I and HLT_D."
+                    )
+                    getattr(self, "_logger", logging.getLogger(type(self).__name__)).error(
+                        "PIDHerms: %s", message
+                    )
+                    self.cbpi.notify("PIDHerms", message, NotificationType.ERROR)
+                await clock.sleep(self.sample_time)
+                continue
+            if demand_fault_notified:
+                demand_fault_notified = False
+                self.cbpi.notify(
+                    "PIDHerms",
+                    "The PID's output is a number again - heating resumed",
+                    NotificationType.INFO,
+                )
+
             # Drive the actor from what it IS doing, not from what this loop
             # last told it to do.
             #
@@ -1354,14 +1407,13 @@ class PID_HERMS(CBPiKettleLogic):
             # instance; it never changes state. For a plain GPIOActor that
             # means a demand of 0% would leave the actor nominally on at 0% duty
             # rather than genuinely off, which is why the off below exists at
-            # all. The dwell keeps it from chattering around zero demand.
+            # all.
             actual_on, actual_power, known = self._heater_now()
             if not known:
                 actual_on = heater_is_on
                 actual_power = heat_percent_old
 
             if heat_percent > 0:
-                zero_demand_samples = 0
                 if not actual_on:
                     await self.actor_on(self.heater, heat_percent)
                 elif actual_power != heat_percent:
@@ -1369,14 +1421,21 @@ class PID_HERMS(CBPiKettleLogic):
                 heater_is_on = True
                 heat_percent_old = heat_percent
             else:
-                zero_demand_samples += 1
-                if zero_demand_samples >= self.OFF_DWELL_SAMPLES:
-                    # Unconditional once the dwell has passed: if this were
-                    # guarded on the local flag, a swallowed failure would flip
-                    # it and the loop would never retry.
-                    await self.actor_off(self.heater)
-                    heater_is_on = False
-                    heat_percent_old = 0
+                # Off on the first decision that asks for nothing. Until it is
+                # commanded the element keeps the duty it last had, so waiting
+                # a few decisions to spare a relay some switching would buy
+                # that with heat nobody asked for. Not worth it on any actor:
+                # an SSR does not wear; an actor that only switches - the
+                # generic MQTT actor has no set_power - would run at full power
+                # while it waited; and a contactor on GPIOActor already
+                # switches once a period at any duty between 0 and 100%.
+                #
+                # Unconditional: if this were guarded on the local flag, a
+                # swallowed failure would flip it and the loop would never
+                # retry.
+                await self.actor_off(self.heater)
+                heater_is_on = False
+                heat_percent_old = 0
 
             # Record what the cascade asked for, when the brewer wants it.
             #
@@ -1439,8 +1498,8 @@ class PID_HERMS(CBPiKettleLogic):
             # Identify the actuators and establish the heater off BEFORE
             # anything that can fail.
             #
-            # Every setting is parsed after this, and those parses can raise -
-            # int("abc") on a SampleTime, float("") on a rest interval, a kettle
+            # Every setting is parsed after this, and setting up can still
+            # raise - a Max_Output of 0, which the PID refuses, or a kettle
             # that cannot be resolved. Were the heater resolved after them,
             # run() would go straight to its finally, which looks for the
             # heater with getattr(self, "heater", None), find it had never been
@@ -1474,8 +1533,20 @@ class PID_HERMS(CBPiKettleLogic):
             # is reported at runtime (see SATURATION_WARN_SECONDS) instead of guessed.
             min_delta = 1.0 if self.TEMP_UNIT == "C" else 2.0
 
-            self.sample_time = int(self.props.get("SampleTime", 5))
-            self.max_output = int(self.props.get("Max_Output", 100))
+            # A SampleTime or Max_Output that is not a number is its default,
+            # and the brewer is told, so the mash still gets its control loop;
+            # so is a SampleTime outside MIN_SAMPLE_TIME to MAX_SAMPLE_TIME.
+            # Blank is the default, quietly.
+            self.sample_time = self._float_prop("SampleTime", 5)
+            if not self.MIN_SAMPLE_TIME <= self.sample_time <= self.MAX_SAMPLE_TIME:
+                self._tell_config(
+                    "SampleTime is set to {:g}. It has to be from {:g} to {:g} "
+                    "seconds, so 5 is used instead.".format(
+                        self.sample_time, self.MIN_SAMPLE_TIME, self.MAX_SAMPLE_TIME
+                    )
+                )
+                self.sample_time = 5.0
+            self.max_output = self._float_prop("Max_Output", 100)
 
             # A simulated rig runs its thermal model faster than real time. If the
             # control loop kept deciding once every sample_time REAL seconds while
@@ -1532,16 +1603,10 @@ class PID_HERMS(CBPiKettleLogic):
             # Blank means "same as DeltaTemp", so nothing changes for anyone who
             # does not set it. Clamped to at least DeltaTemp: a *narrower* band
             # for mash-in would be a configuration mistake, not an intention.
-            mashin = self.props.get("MashIn_DeltaTemp", None)
-            self.mashin_delta = self.delta
-            if mashin not in (None, ""):
-                try:
-                    self.mashin_delta = max(self.delta, float(mashin))
-                except (TypeError, ValueError):
-                    logging.warning(
-                        "PIDHerms: could not parse MashIn_DeltaTemp=%r, using "
-                        "DeltaTemp=%s", mashin, self.delta
-                    )
+            # An infinite one would be no band at all.
+            self.mashin_delta = max(
+                self.delta, self._float_prop("MashIn_DeltaTemp", self.delta)
+            )
             # True unless a step positively tells us otherwise, so every rest,
             # ramp and mashout behaves exactly as before.
             if not hasattr(self, "grain_present"):
@@ -1580,15 +1645,32 @@ class PID_HERMS(CBPiKettleLogic):
                                       getTimeMs=pid_clock)
             self._restore_integral()
 
-            self.work_time = float(self.props.get("Rest_Interval", 600))
-            self.rest_time = float(self.props.get("Rest_Time", 60))
+            # The pump's interval and rest, in seconds. pump_control goes round
+            # on these waits, so an interval of no time at all - 0, negative,
+            # NaN - would have it go round flat out, re-commanding the pump. A
+            # rest of 0 is no rest. An interval or rest that cannot be used is
+            # the default instead, and the brewer is told.
+            self.work_time = self._float_prop("Rest_Interval", 600)
+            if self.work_time <= 0:
+                self._tell_config(
+                    "Rest_Interval is set to {:g}. The pump's interval has to be "
+                    "more than 0 seconds, so 600 is used instead.".format(self.work_time)
+                )
+                self.work_time = 600.0
+            self.rest_time = self._float_prop("Rest_Time", 60)
+            if self.rest_time < 0:
+                self._tell_config(
+                    "Rest_Time is set to {:g}. The pump's rest can't be less "
+                    "than 0 seconds, so 60 is used instead.".format(self.rest_time)
+                )
+                self.rest_time = 60.0
             # Defaults to resting, so a configuration without the setting still
             # rests its pump. A rest time of zero also disables it, but only
             # after switching the pump off and straight back on again every
             # interval, which is a needless contactor cycle - this skips the
             # rest entirely.
             self.pump_rest_enabled = self.props.get("Pump_Rest", "Yes") != "No"
-            self.max_output_boil = float(self.props.get("Max_Boil_Output", 85))
+            self.max_output_boil = self._float_prop("Max_Boil_Output", 85)
 
             self.sensor_stale_seconds = self._float_prop(
                 "Sensor_Stale_Seconds", self.DEFAULT_SENSOR_STALE_SECONDS
@@ -1751,6 +1833,16 @@ class PIDArduino(object):
         self._outputMax = value
         self._iTerm = min(self._iTerm, value)
         self._lastOutput = min(self._lastOutput, value)
+
+    def reset(self):
+        """Start again from nothing, as a new controller would: no integral,
+        no history, and the next calc() seeded from the reading it is given.
+        For a state that is no longer a number, which calc() would otherwise
+        carry into every output after it."""
+        self._iTerm = 0
+        self._lastInput = None
+        self._lastOutput = 0
+        self._lastCalc = None
 
     def calc(self, inputValue, setpoint):
         now = self._getTimeMs()
