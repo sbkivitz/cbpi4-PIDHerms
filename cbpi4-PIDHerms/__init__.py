@@ -71,6 +71,32 @@ class PID_HERMS(CBPiKettleLogic):
     # minutes is still far longer than the 15s/30s source-age conventions, but
     # bounds a frozen mash probe before an active HERMS can drift badly.
     DEFAULT_SENSOR_STALE_SECONDS = 300
+    # What run() takes each setting left empty as (blank_defaults). The
+    # temperature limits are Celsius, and DeltaTemp is in Celsius degrees;
+    # blank_defaults() gives them in the configured unit. Not here, because an
+    # empty one is not a number but a way of working: MashIn_DeltaTemp (it is
+    # DeltaTemp), MashIn_Pump_Within (the pump circulates from the start), and
+    # the links HLT_Sensor and HLT_Kettle (found from HLT_Sensor).
+    BLANK = {
+        "DeltaTemp": 3.0,
+        "P": 2.0,
+        "I": 0.005,
+        "D": 0.0,
+        "HLT_P": 117.0795,
+        "HLT_I": 0.2747,
+        "HLT_D": 41.58,
+        "SampleTime": 5,
+        "Max_Pump_Temp": 88,
+        "Max_Output": 100,
+        "Max_Boil_Output": 85,
+        "Max_Boil_Temp": 98,
+        "Max_PID_Temp": 88,
+        "Sensor_Stale_Seconds": DEFAULT_SENSOR_STALE_SECONDS,
+        "Rest_Interval": 600,
+        "Rest_Time": 60,
+        "Pump_Rest": "Yes",
+    }
+    BLANK_TEMPERATURES = ("Max_Pump_Temp", "Max_Boil_Temp", "Max_PID_Temp")
     # DS18B20 12-bit resolution is 0.0625 C, or 0.1125 F. Treat adjacent
     # quantised values as unchanged so a probe flapping one count cannot reset
     # the stale timer forever.
@@ -383,12 +409,29 @@ class PID_HERMS(CBPiKettleLogic):
             return float(default)
         return parsed
 
-    def _temp_default(self, celsius):
-        """Return a temperature default in the configured unit."""
+    @staticmethod
+    def _absolute_in(celsius, unit):
+        """A temperature in Celsius, in `unit`: Fahrenheit for anything but "C"."""
         celsius = float(celsius)
-        if getattr(self, "TEMP_UNIT", "C") == "C":
+        if unit == "C":
             return celsius
         return celsius * 9.0 / 5.0 + 32.0
+
+    @classmethod
+    def blank_defaults(cls, unit):
+        """What run() uses for each setting left empty, in `unit` ("C" or "F"):
+        BLANK, with the temperature limits and DeltaTemp in that unit. run()
+        reads the same table, so the two can't drift apart."""
+        values = dict(cls.BLANK)
+        for label in cls.BLANK_TEMPERATURES:
+            values[label] = cls._absolute_in(values[label], unit)
+        if unit != "C":
+            values["DeltaTemp"] = float(values["DeltaTemp"]) * 9.0 / 5.0
+        return values
+
+    def _temp_default(self, celsius):
+        """Return a temperature default in the configured unit."""
+        return self._absolute_in(celsius, getattr(self, "TEMP_UNIT", "C"))
 
     # Below this, an absolute temperature threshold cannot be a Fahrenheit
     # value a brewer meant. A mash runs near 150 F, so any of these thresholds
@@ -567,7 +610,7 @@ class PID_HERMS(CBPiKettleLogic):
         default, anything configured is used as written, and an ambiguous value
         tells the brewer rather than overriding them.
         """
-        default = 3.0 if getattr(self, "TEMP_UNIT", "C") == "C" else 5.4
+        default = self.blank_defaults(getattr(self, "TEMP_UNIT", "C"))["DeltaTemp"]
         value = self.props.get("DeltaTemp", None)
         if value is None or str(value).strip() == "":
             return default
@@ -584,7 +627,7 @@ class PID_HERMS(CBPiKettleLogic):
             )
             return default
         if (getattr(self, "TEMP_UNIT", "C") != "C"
-                and abs(parsed - 3.0) < 1e-9):
+                and abs(parsed - float(self.BLANK["DeltaTemp"])) < 1e-9):
             # Reported, not overridden. Unlike the absolute thresholds, both
             # readings of this one are safe - a 3 degree band tracks tighter
             # and ramps slower, a 5.4 degree band the reverse - so the brewer's
@@ -1525,6 +1568,8 @@ class PID_HERMS(CBPiKettleLogic):
                 await self.actor_off(self.heater)
 
             self.TEMP_UNIT = self.get_config_value("TEMP_UNIT", "C")
+            # Each setting left empty is what blank_defaults() says it is.
+            blank = self.blank_defaults(self.TEMP_UNIT)
             # A HERMS only moves heat while the HLT is hotter than the wort. A zero or
             # negative band leaves the outer loop no authority at all, so the mash would
             # never reach target. Hold a small floor rather than stalling. This floor
@@ -1537,16 +1582,17 @@ class PID_HERMS(CBPiKettleLogic):
             # and the brewer is told, so the mash still gets its control loop;
             # so is a SampleTime outside MIN_SAMPLE_TIME to MAX_SAMPLE_TIME.
             # Blank is the default, quietly.
-            self.sample_time = self._float_prop("SampleTime", 5)
+            self.sample_time = self._float_prop("SampleTime", blank["SampleTime"])
             if not self.MIN_SAMPLE_TIME <= self.sample_time <= self.MAX_SAMPLE_TIME:
                 self._tell_config(
                     "SampleTime is set to {:g}. It has to be from {:g} to {:g} "
-                    "seconds, so 5 is used instead.".format(
-                        self.sample_time, self.MIN_SAMPLE_TIME, self.MAX_SAMPLE_TIME
+                    "seconds, so {:g} is used instead.".format(
+                        self.sample_time, self.MIN_SAMPLE_TIME, self.MAX_SAMPLE_TIME,
+                        blank["SampleTime"]
                     )
                 )
-                self.sample_time = 5.0
-            self.max_output = self._float_prop("Max_Output", 100)
+                self.sample_time = float(blank["SampleTime"])
+            self.max_output = self._float_prop("Max_Output", blank["Max_Output"])
 
             # A simulated rig runs its thermal model faster than real time. If the
             # control loop kept deciding once every sample_time REAL seconds while
@@ -1576,9 +1622,9 @@ class PID_HERMS(CBPiKettleLogic):
             # PID's own output by DeltaTemp makes the band limit and the PID's
             # anti-windup boundary the same thing, so the integral cannot wind up
             # against the cap.
-            p = self._float_prop("P", 2.0)
-            i = self._float_prop("I", 0.005)
-            d = self._float_prop("D", 0.0)
+            p = self._float_prop("P", blank["P"])
+            i = self._float_prop("I", blank["I"])
+            d = self._float_prop("D", blank["D"])
             # Guard against a config written for <=0.0.6, where P/I/D were heater-percent
             # gains. Such a value saturates the outer loop almost instantly, which pins
             # the HLT at the top of the band and silently reverts to fixed-offset
@@ -1638,9 +1684,9 @@ class PID_HERMS(CBPiKettleLogic):
                 )
 
             # Inner loop: HLT error -> heater percent. These are the AutoTune-style gains.
-            hp = self._float_prop("HLT_P", 117.0795)
-            hi = self._float_prop("HLT_I", 0.2747)
-            hd = self._float_prop("HLT_D", 41.58)
+            hp = self._float_prop("HLT_P", blank["HLT_P"])
+            hi = self._float_prop("HLT_I", blank["HLT_I"])
+            hd = self._float_prop("HLT_D", blank["HLT_D"])
             self.hlt_pid = PIDArduino(self.sample_time, hp, hi, hd, 0, self.max_output,
                                       getTimeMs=pid_clock)
             self._restore_integral()
@@ -1650,41 +1696,44 @@ class PID_HERMS(CBPiKettleLogic):
             # NaN - would have it go round flat out, re-commanding the pump. A
             # rest of 0 is no rest. An interval or rest that cannot be used is
             # the default instead, and the brewer is told.
-            self.work_time = self._float_prop("Rest_Interval", 600)
+            self.work_time = self._float_prop("Rest_Interval", blank["Rest_Interval"])
             if self.work_time <= 0:
                 self._tell_config(
                     "Rest_Interval is set to {:g}. The pump's interval has to be "
-                    "more than 0 seconds, so 600 is used instead.".format(self.work_time)
+                    "more than 0 seconds, so {:g} is used instead.".format(
+                        self.work_time, blank["Rest_Interval"])
                 )
-                self.work_time = 600.0
-            self.rest_time = self._float_prop("Rest_Time", 60)
+                self.work_time = float(blank["Rest_Interval"])
+            self.rest_time = self._float_prop("Rest_Time", blank["Rest_Time"])
             if self.rest_time < 0:
                 self._tell_config(
                     "Rest_Time is set to {:g}. The pump's rest can't be less "
-                    "than 0 seconds, so 60 is used instead.".format(self.rest_time)
+                    "than 0 seconds, so {:g} is used instead.".format(
+                        self.rest_time, blank["Rest_Time"])
                 )
-                self.rest_time = 60.0
+                self.rest_time = float(blank["Rest_Time"])
             # Defaults to resting, so a configuration without the setting still
             # rests its pump. A rest time of zero also disables it, but only
             # after switching the pump off and straight back on again every
             # interval, which is a needless contactor cycle - this skips the
             # rest entirely.
-            self.pump_rest_enabled = self.props.get("Pump_Rest", "Yes") != "No"
-            self.max_output_boil = self._float_prop("Max_Boil_Output", 85)
+            self.pump_rest_enabled = self.props.get("Pump_Rest", blank["Pump_Rest"]) != "No"
+            self.max_output_boil = self._float_prop("Max_Boil_Output", blank["Max_Boil_Output"])
 
             self.sensor_stale_seconds = self._float_prop(
-                "Sensor_Stale_Seconds", self.DEFAULT_SENSOR_STALE_SECONDS
+                "Sensor_Stale_Seconds", blank["Sensor_Stale_Seconds"]
             )
             if self.sensor_stale_seconds <= 0:
                 logging.warning(
                     "PIDHerms: Sensor_Stale_Seconds %s is not positive, using %s",
-                    self.sensor_stale_seconds, self.DEFAULT_SENSOR_STALE_SECONDS
+                    self.sensor_stale_seconds, blank["Sensor_Stale_Seconds"]
                 )
-                self.sensor_stale_seconds = self.DEFAULT_SENSOR_STALE_SECONDS
+                self.sensor_stale_seconds = blank["Sensor_Stale_Seconds"]
 
-            self.max_boil_temp = self._temperature_prop("Max_Boil_Temp", 98)
-            self.max_pid_temp = self._temperature_prop("Max_PID_Temp", 88)
-            self.max_pump_temp = self._temperature_prop("Max_Pump_Temp", 88)
+            # In Celsius here: _temperature_prop() converts them as blank_defaults() does.
+            self.max_boil_temp = self._temperature_prop("Max_Boil_Temp", self.BLANK["Max_Boil_Temp"])
+            self.max_pid_temp = self._temperature_prop("Max_PID_Temp", self.BLANK["Max_PID_Temp"])
+            self.max_pump_temp = self._temperature_prop("Max_Pump_Temp", self.BLANK["Max_Pump_Temp"])
             # Each start announces a limit afresh if the mash is already past it.
             self._limits_announced = set()
 
