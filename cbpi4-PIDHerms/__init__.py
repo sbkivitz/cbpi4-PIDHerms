@@ -14,7 +14,7 @@ import datetime
              Property.Number(label="MashIn_DeltaTemp", configurable=True,
                              description="Width of the HLT overshoot band while the mash tun holds only water, i.e. during Mash In before the grain goes in. DeltaTemp is a compromise between ramp rate and not cooking enzymes in the coil - but there are no enzymes in the tun yet, so that compromise is being paid for nothing. Measured on a 30 L / 6.5 kW HERMS heating tap water to a 163 F strike: at DeltaTemp 5.4 F the ramp takes 64 min and 13.6 of those are spent on the final 5 F; at 12 F it is 54 min with 5.2 on the final 5 F. Returns flatten past about 18 F because the element saturates. Leave blank to use DeltaTemp and change nothing. The wider band applies only from the start of Mash In until strike temperature is reached, which is exactly the window in which the tun is known to be grain-free."),
              Property.Number(label="MashIn_Pump_Within", configurable=True,
-                             description="Mash In only, while the tun holds water and no grain: keep the pump off and heat the HLT alone until it is within this many degrees of the mash target, then circulate - so hot water runs through the hoses for the end of the heat-up only, which is worth having for an unattended start such as BrewStart's Ready by. The element runs flat out either way, so the heat-up takes about as long. Set it wider than the HLT element's proportional band, about 100 / HLT_P degrees, or the element backs off while it waits. If the HLT stops warming while it waits, the pump starts anyway, with a warning. Leave blank to circulate from the start, as before."),
+                             description="Mash In only, while the tun holds water and no grain: keep the pump off and heat the HLT alone until it is within this many degrees of the mash target, then ask you to start the wort pump - so hot water runs through the hoses for the end of the heat-up only. The element runs flat out either way, so the heat-up takes about as long. Set it wider than the HLT element's proportional band, about 100 / HLT_P degrees, or the element backs off while it waits. If the HLT stops warming while it waits, you are asked for the pump anyway, with a warning. Leave blank to be asked for the pump from the start. The pump never starts by itself: until you start it, nothing heats the mash through the coil."),
              Property.Number(label="P", configurable=True, default_value=2.0,
                              description="P value of the mash (outer) PID, in degrees of HLT offset per degree of mash error. NOTE: these are NOT heater-percent gains and must not be taken from the PID AutoTune plugin - use HLT_P/HLT_I/HLT_D for that."),
              Property.Number(label="I", configurable=True, default_value=0.005,
@@ -75,7 +75,7 @@ class PID_HERMS(CBPiKettleLogic):
     # temperature limits are Celsius, and DeltaTemp is in Celsius degrees;
     # blank_defaults() gives them in the configured unit. Not here, because an
     # empty one is not a number but a way of working: MashIn_DeltaTemp (it is
-    # DeltaTemp), MashIn_Pump_Within (the pump circulates from the start), and
+    # DeltaTemp), MashIn_Pump_Within (the pump is asked for from the start), and
     # the links HLT_Sensor and HLT_Kettle (found from HLT_Sensor).
     BLANK = {
         "DeltaTemp": 3.0,
@@ -921,6 +921,46 @@ class PID_HERMS(CBPiKettleLogic):
         self._hlt_kettle = None
         self._hlt_target_before = None
     
+    def _pump_core_can_say(self):
+        """Whether the core keeps the brewer's pump starts (StepController.may_start_pump). On an older core the pump
+        runs as it always did."""
+        stepper = getattr(self.cbpi, "step", None)
+        return bool(getattr(self, "agitator", None)) and asyncio.iscoroutinefunction(
+            getattr(stepper, "may_start_pump", None)) and callable(getattr(stepper, "pump_started", None))
+
+    def _pump_started_by_brewer(self):
+        """Whether the brewer's start of the wort pump stands (StepController.pump_started): he started it - its own
+        press, or Start pump - and hasn't stopped it, or it is running. True on a core that can't say."""
+        if not self._pump_core_can_say():
+            return True
+        try:
+            return self.cbpi.step.pump_started(self.agitator) is True
+        except Exception as e:  # noqa: BLE001 - not knowing is no permission
+            logging.warning("PIDHerms: could not tell whether the wort pump was started, so it waits: %s", e)
+            return False
+
+    async def _may_run_pump(self):
+        """Whether this logic may switch the wort pump on now. The pump never starts by itself: until the brewer has
+        started it, the core asks him for it, once a step - "Start the wort pump to recirculate.", with Start pump -
+        and this says no. He stopped it himself during the step: not asked again, the step's line says it's off.
+        True on a core that can't say."""
+        if not self._pump_core_can_say():
+            return True
+        try:
+            return await self.cbpi.step.may_start_pump(self.agitator, purpose="recirculate", quiet=True) is True
+        except Exception as e:  # noqa: BLE001 - not knowing is no permission
+            logging.warning("PIDHerms: could not ask for the wort pump, so it waits: %s", e)
+            return False
+
+    async def _wait_for_pump_start(self):
+        """The wort pump's loop while it waits for the brewer to start the pump: the element held off by temp_control
+        (no heat goes through the coil without flow), once said in the log."""
+        if not getattr(self, "_waiting_for_pump", False):
+            logging.info("PIDHerms: waiting for the brewer to start the wort pump; nothing heats the mash through "
+                         "the coil until he does")
+        self._waiting_for_pump = True
+        await clock.sleep(1)
+
     def _strike_water_in(self):
         """Whether the strike water is in the mash tun for this brew, as the brewer has said
         (StepController.strike_move_confirmed: his NEXT or answer out of the step holding the water, his START of a
@@ -1016,29 +1056,30 @@ class PID_HERMS(CBPiKettleLogic):
         return True
 
     def _start_mashin_pump(self, hlt, target, why):
-        """End the mash-in wait: from here the pump runs until the grain goes in."""
+        """End the mash-in wait: from here the pump is wanted until the grain goes in. It starts once the brewer
+        starts it (pump_control asks him)."""
         self._mashin_pump_started = True
         self._mashin_wait = None
         unit = getattr(self, "TEMP_UNIT", "C")
         if why == "near":
             message = ("HLT at {:.1f} {u}, within {:g} {u} of the {:.1f} {u} mash "
-                       "target: starting the pump.").format(
+                       "target: time to start the wort pump.").format(
                            hlt, self.mashin_pump_within, target, u=unit)
             kind = NotificationType.INFO
         elif why == "stalled":
             message = ("The HLT has not warmed in {} minutes with its element on - it "
                        "is at {:.1f} {u}. Check the selector, the element and its SSR. "
-                       "Starting the pump, so the mash-in carries on as it would "
-                       "have.").format(int(self.MASHIN_WAIT_STALL_SECONDS // 60), hlt, u=unit)
+                       "The wort pump is wanted now, so the mash-in carries on as it "
+                       "would have.").format(int(self.MASHIN_WAIT_STALL_SECONDS // 60), hlt, u=unit)
             kind = NotificationType.WARNING
         elif why == "settled":
             message = ("HLT holding at {:.1f} {u}, short of the {:.1f} {u} it waits "
-                       "for: starting the pump.").format(
+                       "for: time to start the wort pump.").format(
                            hlt, target - self.mashin_pump_within, u=unit)
             kind = NotificationType.INFO
         else:
             logging.warning("PIDHerms: MashIn_Pump_Within cannot read the HLT or the "
-                            "mash target - circulating from now, as before")
+                            "mash target - the wort pump is wanted from now, as before")
             return False
         logging.log(logging.WARNING if kind == NotificationType.WARNING else logging.INFO,
                     "PIDHerms: %s", message)
@@ -1050,9 +1091,9 @@ class PID_HERMS(CBPiKettleLogic):
 
     def _announce_mashin_wait(self, hlt, target):
         unit = getattr(self, "TEMP_UNIT", "C")
-        message = ("Mash In: heating the HLT first. The pump starts when the HLT "
-                   "reaches {:.1f} {u}, {:g} {u} below the {:.1f} {u} mash target; it "
-                   "is at {:.1f} {u}.").format(
+        message = ("Mash In: heating the HLT first. You'll be asked to start the wort "
+                   "pump when the HLT reaches {:.1f} {u}, {:g} {u} below the {:.1f} {u} "
+                   "mash target; it is at {:.1f} {u}.").format(
                        target - self.mashin_pump_within, self.mashin_pump_within,
                        target, hlt, u=unit)
         logging.info("PIDHerms: %s", message)
@@ -1096,6 +1137,9 @@ class PID_HERMS(CBPiKettleLogic):
             # A mash-in that starts while the pump is mid-interval waits too.
             if self._mashin_pump_waiting():
                 return "hold"
+            # The brewer stopped the pump, or it was stopped for safety: it waits for him to start it again.
+            if not self._pump_started_by_brewer():
+                return "brewer"
             if sensor_check:
                 try:
                     reading = self.get_sensor_value(self.kettle.sensor).get("value")
@@ -1113,6 +1157,7 @@ class PID_HERMS(CBPiKettleLogic):
         while self.running:
             # Nothing pumped into the mash tun before the brewer has said its strike water is in it.
             if not self._strike_water_in():
+                self._waiting_for_pump = False
                 await self._wait_for_strike_water()
                 continue
             if getattr(self, "_strike_waiting", False):
@@ -1129,6 +1174,7 @@ class PID_HERMS(CBPiKettleLogic):
             # with the pump running and by -0.1 F with it stopped. An element
             # cannot do that, because an element coasts.
             if getattr(self, "pump_hold", False):
+                self._waiting_for_pump = False
                 try:
                     if (self.pump is not None and self.pump.instance
                             and self.pump.instance.state):
@@ -1140,6 +1186,7 @@ class PID_HERMS(CBPiKettleLogic):
             # Mash-in with MashIn_Pump_Within set: heat the HLT alone until it
             # nears the mash target, then circulate. Off the same way as a hold.
             if self._mashin_pump_waiting():
+                self._waiting_for_pump = False
                 try:
                     if (self.pump is not None and self.pump.instance
                             and self.pump.instance.state):
@@ -1164,13 +1211,22 @@ class PID_HERMS(CBPiKettleLogic):
                 # anything noticed.
                 if getattr(self, "pump_hold", False) or not self.running:
                     continue
+                # The pump never starts by itself. Until the brewer has started it, he is asked, once a step, and
+                # nothing heats the mash through the coil (temp_control). His start stands across the rests below,
+                # and into the next step, until he stops it or it is stopped for safety.
+                if not await self._may_run_pump():
+                    await self._wait_for_pump_start()
+                    continue
+                if getattr(self, "_waiting_for_pump", False):
+                    logging.info("PIDHerms: the brewer started the wort pump - circulating")
+                self._waiting_for_pump = False
                 #switch the pump on
                 await self.actor_on(self.agitator)
                 # Run the interval, but stay responsive to a hold or a stop.
                 # Brewing seconds, like every other duration here - the clock
                 # decides how fast those pass.
                 reason = await self._pump_wait(self.work_time, sensor_check=True)
-                if reason in ("hold", "stopped"):
+                if reason in ("hold", "stopped", "brewer"):
                     # The hold branch at the top of the loop does the switching
                     # off, so it sees a consistent state either way.
                     continue
@@ -1205,6 +1261,7 @@ class PID_HERMS(CBPiKettleLogic):
             # If temeprature is above max pump temp, and pump is on, switch it off
             # Staops also the pump if user switches it on and temp is abouve max pump temp
             else:
+                self._waiting_for_pump = False
                 if pump_on:
                     self._logger.debug("pump max temp reached, pump turned off")
                     await self.actor_off(self.agitator)
@@ -1235,6 +1292,16 @@ class PID_HERMS(CBPiKettleLogic):
             # element is left to the HLT's own AUTO (BrewStart may be holding the water on it), and switched off
             # only if this loop had it on.
             if not self._strike_water_in():
+                if heater_is_on:
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
+                    heat_percent_old = 0
+                self.heat_available = False
+                await clock.sleep(self.sample_time)
+                continue
+            # No heat through the coil without flow: while the wort pump waits for the brewer to start it
+            # (pump_control), the element is left alone as above.
+            if getattr(self, "_waiting_for_pump", False):
                 if heater_is_on:
                     await self.actor_off(self.heater)
                     heater_is_on = False
@@ -1715,8 +1782,8 @@ class PID_HERMS(CBPiKettleLogic):
             if not hasattr(self, "pump_hold"):
                 self.pump_hold = False
             # Mash-in only: heat the HLT alone until it nears the mash target.
-            # Blank means circulate from the start, so nothing changes for
-            # anyone who does not set it.
+            # Blank means the pump is wanted from the start, so nothing changes
+            # for anyone who does not set it.
             self.mashin_pump_within = None
             within = self.props.get("MashIn_Pump_Within", None)
             if within not in (None, ""):
@@ -1727,10 +1794,13 @@ class PID_HERMS(CBPiKettleLogic):
                 except (TypeError, ValueError):
                     logging.warning(
                         "PIDHerms: could not parse MashIn_Pump_Within=%r, "
-                        "circulating from the start", within
+                        "the wort pump is wanted from the start", within
                     )
             self._mashin_pump_started = False
             self._mashin_wait = None
+            # Until pump_control has looked, the element waits as if the pump did: it never heats through the coil
+            # for a moment before anything has asked whether the wort is moving.
+            self._waiting_for_pump = not self._pump_started_by_brewer()
             self._active_band = self.delta
             if self.mashin_delta != self.delta:
                 logging.info(
