@@ -1137,8 +1137,11 @@ class PID_HERMS(CBPiKettleLogic):
             # A mash-in that starts while the pump is mid-interval waits too.
             if self._mashin_pump_waiting():
                 return "hold"
-            # The brewer stopped the pump, or it was stopped for safety: it waits for him to start it again.
+            # The brewer stopped the pump, or it was stopped for safety: it waits for him to start it again. A
+            # second first, so pump_control, which asks again at once, never goes round without letting the rest
+            # of CraftBeerPi run.
             if not self._pump_started_by_brewer():
+                await clock.sleep(1)
                 return "brewer"
             if sensor_check:
                 try:
