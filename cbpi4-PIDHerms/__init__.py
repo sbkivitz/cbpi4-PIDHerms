@@ -921,6 +921,43 @@ class PID_HERMS(CBPiKettleLogic):
         self._hlt_kettle = None
         self._hlt_target_before = None
     
+    def _strike_water_in(self):
+        """Whether the strike water is in the mash tun for this brew, as the brewer has said
+        (StepController.strike_move_confirmed: his NEXT or answer out of the step holding the water, his START of a
+        mash tun step, his own press of the wort pump or of this AUTO, or Water's in). Until he has, this logic runs
+        neither the wort pump nor the HLT element: nothing is pumped into an empty mash tun, and nothing heats it
+        through the coil. True on a core that can't say, and unless the core says no."""
+        said = getattr(getattr(self.cbpi, "step", None), "strike_move_confirmed", None)
+        if not callable(said):
+            return True
+        try:
+            return said() is not False
+        except Exception as e:  # noqa: BLE001 - not knowing is no permission
+            logging.warning("PIDHerms: could not tell whether the strike water is in the mash tun, so the "
+                            "wort pump and the coil wait: %s", e)
+            return False
+
+    async def _wait_for_strike_water(self):
+        """The wort pump's loop, while the strike water isn't in the mash tun: the pump off, once, and the brewer
+        told how to go on ("Wort pump held", with Water's in, from the core)."""
+        if not getattr(self, "_strike_waiting", False):
+            self._strike_waiting = True
+            logging.warning("PIDHerms: the strike water isn't in the mash tun yet, so the wort pump stays off "
+                            "and nothing heats the mash through the coil")
+            try:
+                pump = self.cbpi.actor.find_by_id(self.agitator) if self.agitator else None
+                if pump is not None and getattr(pump.instance, "state", False):
+                    await self.actor_off(self.agitator)
+            except Exception as e:  # noqa: BLE001
+                self._logger.error("PIDHerms: could not switch the wort pump off: %s", e)
+            refuses = getattr(getattr(self.cbpi, "step", None), "strike_move_refuses", None)
+            if self.agitator and asyncio.iscoroutinefunction(refuses):
+                try:
+                    await refuses(self.agitator, logic_kettle=self.id)
+                except Exception as e:  # noqa: BLE001 - telling never stops the wait
+                    logging.warning("PIDHerms: could not tell the brewer the wort pump waits: %s", e)
+        await clock.sleep(1)
+
     def _mashin_pump_waiting(self):
         """Mash-in, water only: is the pump waiting for the HLT to near the target?
 
@@ -1074,6 +1111,13 @@ class PID_HERMS(CBPiKettleLogic):
         self.pump = self.cbpi.actor.find_by_id(self.agitator)
 
         while self.running:
+            # Nothing pumped into the mash tun before the brewer has said its strike water is in it.
+            if not self._strike_water_in():
+                await self._wait_for_strike_water()
+                continue
+            if getattr(self, "_strike_waiting", False):
+                self._strike_waiting = False
+                logging.info("PIDHerms: the strike water is in the mash tun - circulating")
             # A step can ask for no flow at all.
             #
             # Mash-in does, the moment strike temperature is reached: grain
@@ -1187,6 +1231,17 @@ class PID_HERMS(CBPiKettleLogic):
         band_warning_sent = False
 
         while self.running:
+            # Before the brewer has said the strike water is in the mash tun, no heat goes through the coil: the
+            # element is left to the HLT's own AUTO (BrewStart may be holding the water on it), and switched off
+            # only if this loop had it on.
+            if not self._strike_water_in():
+                if heater_is_on:
+                    await self.actor_off(self.heater)
+                    heater_is_on = False
+                    heat_percent_old = 0
+                self.heat_available = False
+                await clock.sleep(self.sample_time)
+                continue
             # Parsed before the sensor reads because the repeated-value watch
             # needs to know whether each reading is expected to be climbing.
             try:
